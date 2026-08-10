@@ -90,6 +90,14 @@ enum BC_OP {
 	BC_OP_ILOOP, // unsupported
 	BC_OP_JLOOP, // unsupported
 	BC_OP_JMP, // goto D<JUMP> or if true then JMP or goto ITERC at D
+	// LuaJIT 2.1 新增位运算（lj_bc.h BCDEF：BNOT..BSAR 位于 JMP 与 FUNCF 之间）
+	BC_OP_BNOT, // unsupported (bitwise not)
+	BC_OP_BAND, // unsupported (bitwise and)
+	BC_OP_BOR, // unsupported (bitwise or)
+	BC_OP_BXOR, // unsupported (bitwise xor)
+	BC_OP_BSHL, // unsupported (bitwise shift left)
+	BC_OP_BSHR, // unsupported (bitwise shift right)
+	BC_OP_BSAR, // unsupported (bitwise arithmetic shift right)
 	BC_OP_FUNCF, // unsupported
 	BC_OP_IFUNCF, // unsupported
 	BC_OP_JFUNCF, // unsupported
@@ -101,7 +109,7 @@ enum BC_OP {
 	BC_OP_INVALID
 };
 
-struct Bytecode::Instruction {
+struct Instruction {
 	BC_OP type;
 	uint8_t a = 0;
 	uint8_t b = 0;
@@ -145,7 +153,16 @@ static bool is_op_abc_format(const BC_OP& instruction) {
 	case BC_OP_ITERC:
 	case BC_OP_ITERN:
 	case BC_OP_VARG:
+	// LuaJIT 2.1 位运算（ABC 格式；BNOT 为 AD 格式，不在本表）
+	case BC_OP_BAND:
+	case BC_OP_BOR:
+	case BC_OP_BXOR:
+	case BC_OP_BSHL:
+	case BC_OP_BSHR:
+	case BC_OP_BSAR:
 		return true;
+	default:
+		break;
 	}
 
 	return false;

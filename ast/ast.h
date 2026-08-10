@@ -10,8 +10,6 @@ private:
 		NUMBER_CONSTANT
 	};
 
-	struct Local;
-	struct SlotScope;
 	struct ConditionBuilder;
 
 public:
@@ -24,6 +22,8 @@ public:
 	struct UnaryOperation;
 	struct Statement;
 	struct Function;
+	struct Local;
+	struct SlotScope;
 	#include "building_blocks.h"
 	#include "function.h"
 
@@ -36,7 +36,7 @@ public:
 
 private:
 
-	#include "conditionBuilder.h";
+	#include "conditionBuilder.h"
 
 	struct BlockInfo {
 		uint32_t index = INVALID_ID;

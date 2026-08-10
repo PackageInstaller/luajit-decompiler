@@ -1,4 +1,4 @@
-#include "..\main.h"
+#include "../main.h"
 
 Lua::Lua(const Bytecode& bytecode, const Ast& ast, const std::string& filePath, const bool& forceOverwrite, const bool& minimizeDiffs, const bool& unrestrictedAscii)
 	: bytecode(bytecode), ast(ast), filePath(filePath), forceOverwrite(forceOverwrite), minimizeDiffs(minimizeDiffs), unrestrictedAscii(unrestrictedAscii) {}
@@ -794,7 +794,7 @@ void Lua::write_function_definition(const Ast::Function& function, const bool& i
 	if (function.isVariadic) write("...");
 	write(")", NEW_LINE);
 	indentLevel++;
-#if defined _DEBUG
+#if !defined(NDEBUG)
 	write_indent();
 	write("-- function ", std::to_string(function.id), NEW_LINE);
 #endif
@@ -825,6 +825,18 @@ void Lua::write_number(const double& number) {
 
 	if ((rawDouble & DOUBLE_EXPONENT) == DOUBLE_SPECIAL) {
 		write(rawDouble & DOUBLE_SIGN ? "-1e309" : "1e309");
+		return;
+	}
+
+	// 次正规数（最小 double 2^-1074 等）：%g 往返受 C 运行库 strtod 下溢影响，
+	// 改用 LuaJIT 支持的精确十六进制浮点字面量 0x0.<13位hex>p-1022。
+	// （±0.0 不属于次正规数，继续走 %g 保持与上游一致的 "0"/"-0" 输出。）
+	if ((rawDouble & DOUBLE_EXPONENT) == 0 && (rawDouble & DOUBLE_FRACTION) != 0) {
+		const uint64_t fraction = rawDouble & DOUBLE_FRACTION;
+		char buffer[64];
+		std::snprintf(buffer, sizeof(buffer), "%s0x0.%013llxp-1022",
+			rawDouble & DOUBLE_SIGN ? "-" : "", (unsigned long long)fraction);
+		write(buffer);
 		return;
 	}
 
@@ -1002,30 +1014,23 @@ void Lua::write_indent() {
 }
 
 void Lua::create_file() {
-#ifndef _DEBUG
+#if defined(NDEBUG)
 	if (!forceOverwrite) {
-		file = CreateFileA(filePath.c_str(), GENERIC_READ, NULL, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-
-		if (file != INVALID_HANDLE_VALUE) {
-			close_file();
-			assert(MessageBoxA(NULL, ("The file " + filePath + " already exists.\n\nDo you want to overwrite it?").c_str(), PROGRAM_NAME, MB_ICONWARNING | MB_YESNO | MB_DEFBUTTON2) == IDYES,
-				"File already exists", filePath, DEBUG_INFO);
-		}
+		assert(!std::filesystem::exists(filePath),
+			"File already exists (use -f / --force_overwrite to overwrite)", filePath, DEBUG_INFO);
 	}
 #endif
-	file = CreateFileA(filePath.c_str(), GENERIC_WRITE, NULL, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, NULL);
-	assert(file != INVALID_HANDLE_VALUE, "Unable to create file", filePath, DEBUG_INFO);
+	fileStream.open(filePath, std::ios::binary | std::ios::trunc);
+	assert(fileStream.is_open(), "Unable to create file", filePath, DEBUG_INFO);
 }
 
 void Lua::close_file() {
-	if (file == INVALID_HANDLE_VALUE) return;
-	CloseHandle(file);
-	file = INVALID_HANDLE_VALUE;
+	if (fileStream.is_open()) fileStream.close();
 }
 
 void Lua::write_file() {
-	DWORD charsWritten = 0;
-	assert(WriteFile(file, writeBuffer.data(), writeBuffer.size(), &charsWritten, NULL) && !(writeBuffer.size() - charsWritten), "Failed writing to file", filePath, DEBUG_INFO);
+	fileStream.write(writeBuffer.data(), writeBuffer.size());
+	assert(!fileStream.fail(), "Failed writing to file", filePath, DEBUG_INFO);
 	writeBuffer.clear();
 	writeBuffer.shrink_to_fit();
 }
