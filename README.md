@@ -47,6 +47,20 @@ C++23 项目：
   - `xxx.lua.bytes` 输出为 `xxx.lua`；
   - 其他扩展名或无扩展名文件统一补 `.lua`。
 
+### v2.0.3  字节码变体兼容性增强
+
+- 放宽主原型必须 vararg/无参的限制（部分变体的顶层 chunk 带固定参数）；
+- 处理"先读后写"的临时槽位（如 `x or {}` 短路模式），残留作用域统一
+  闭合并自动命名；
+- 多返回值调用（`CALL B=0`）放宽使用次数限制，TSETM 无法合并进表构造器
+  时输出 `t[k] = f()` 形式，避免反编译中断；
+- 条件/if 构建增加目标地址标签回退；无法消除的拷贝条件退化为纯测试；
+- 泛型 for 支持 JMP 入口 + 循环体在前的变体布局；
+- 槽位表按 128 分配，防御 framesize 小于实际槽位的字节码；
+- 修复 RET/RETM 表达式填充循环在超过 255 个返回值时因 8 位下标回绕
+  导致的死循环（改为 32 位下标）；
+- 增加空变量、空 tableIndex、空 slotScope 的防御性检查。
+
 ## 构建
 
 要求：支持 C++23 的编译器（GCC 13 或 Clang 16 以上）、CMake 3.20 以上。
@@ -56,12 +70,12 @@ cmake -B build -S .
 cmake --build build -j
 ```
 
-构建产物：`build/luajit-decompiler-v2`。
+构建产物：`build/luajit-decompiler`。
 
 ## 使用
 
 ```bash
-build/luajit-decompiler-v2 INPUT_PATH [选项]
+build/luajit-decompiler INPUT_PATH [选项]
 ```
 
 `INPUT_PATH` 可以是单个 LuaJIT 字节码文件，也可以是目录（目录会递归处理，

@@ -30,7 +30,9 @@ struct Function {
 
 	Function(const Bytecode::Prototype& prototype, const uint32_t& level, const bool& ignoreDebugInfo)
 		: prototype(prototype), isVariadic(prototype.header.flags& Bytecode::BC_PROTO_VARARG), level(level), hasDebugInfo(!ignoreDebugInfo && prototype.header.hasDebugInfo) {
-		slotScopeCollector.slotInfos.resize(prototype.header.framesize);
+		// 部分字节码变体原型的 framesize 小于实际使用的槽位,
+		// 按实测最大真实槽位(<=64)放宽上限, 避免越界同时保持性能。
+		slotScopeCollector.slotInfos.resize(prototype.header.framesize > 128 ? prototype.header.framesize : 128);
 
 		for (uint8_t i = prototype.header.parameters; i--;) {
 			slotScopeCollector.slotInfos[i].isParameter = true;
@@ -362,11 +364,18 @@ struct Function {
 		}
 
 		bool assert_scopes_closed() {
+			bool ok = true;
 			for (uint8_t i = slotInfos.size(); i--;) {
-				if (!slotInfos[i].isParameter && slotInfos[i].activeSlotScope) return false;
+				if (!slotInfos[i].isParameter && slotInfos[i].activeSlotScope) {
+					fprintf(stderr, "[slotscope] slot %u still open (usages=%u begin=%u end=%u)\n",
+						i, (*slotInfos[i].activeSlotScope)->usages,
+						(*slotInfos[i].activeSlotScope)->scopeBegin,
+						(*slotInfos[i].activeSlotScope)->scopeEnd);
+					ok = false;
+				}
 			}
 
-			return true;
+			return ok;
 		}
 
 		void remove_scope(const uint8_t& slot, SlotScope** const& slotScope) {

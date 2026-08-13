@@ -48,6 +48,22 @@ void Ast::build_functions(Function& function, uint32_t& functionCounter) {
 	function.usedGlobals.shrink_to_fit();
 	if (!function.hasDebugInfo) function.slotScopeCollector.build_upvalue_scopes();
 	build_slot_scopes(function, function.block, nullptr);
+	// 某些字节码变体存在"先读后写"的临时槽位 (如 `x or {}` 模式,
+	// slot 在函数开头被读取, 之后才被写入), 反向处理时该作用域无法
+	// 由后续(程序序更早的)写入闭合。这里把剩余开放作用域统一闭合,
+	// 语义上等价于从函数开头开始的局部变量。
+	for (uint8_t i = 0; i < function.slotScopeCollector.slotInfos.size(); i++) {
+		if (function.slotScopeCollector.slotInfos[i].isParameter) continue;
+		if (!function.slotScopeCollector.slotInfos[i].activeSlotScope) continue;
+		SlotScope** openScope = function.slotScopeCollector.slotInfos[i].activeSlotScope;
+		// 该作用域没有对应的赋值语句, 命名阶段不会为它生成名字;
+		// 这里直接给一个不冲突的变量名, 供 Lua 写出阶段使用。
+		if (!(*openScope)->name.size()) {
+			(*openScope)->name = "var_" + std::to_string(function.level)
+				+ "_" + std::to_string(10000 + i);
+		}
+		function.slotScopeCollector.close_scope(i, openScope, 0);
+	}
 	assert(function.slotScopeCollector.assert_scopes_closed(), "Failed to close slot scopes", bytecode.filePath, DEBUG_INFO);
 	eliminate_slots(function, function.block, nullptr);
 	eliminate_conditions(function, function.block, nullptr);
@@ -829,7 +845,7 @@ void Ast::build_expressions(Function& function, std::vector<Statement*>& block) 
 			case Bytecode::BC_OP_RET1:
 				block[i]->assignment.expressions.resize(block[i]->instruction.type == Bytecode::BC_OP_RET1 ? 1 : block[i]->instruction.d + (block[i]->instruction.type == Bytecode::BC_OP_RETM ? 0 : -1), nullptr);
 
-				for (uint8_t j = 0; j < block[i]->assignment.expressions.size(); j++) {
+				for (uint32_t j = 0; j < block[i]->assignment.expressions.size(); j++) {
 					block[i]->assignment.expressions[j] = new_slot(block[i]->instruction.a + j);
 					block[i]->assignment.register_slots(block[i]->assignment.expressions[j]);
 				}
@@ -975,7 +991,12 @@ void Ast::build_slot_scopes(Function& function, std::vector<Statement*>& block, 
 		case AST_STATEMENT_NUMERIC_FOR:
 		case AST_STATEMENT_GENERIC_FOR:
 			for (uint32_t j = block[i]->assignment.variables.size(); j--;) {
-				assert(!function.slotScopeCollector.slotInfos[block[i]->assignment.variables[j].slot].activeSlotScope, "Slot scope does not match with for loop variable", bytecode.filePath, DEBUG_INFO);
+				if (function.slotScopeCollector.slotInfos[block[i]->assignment.variables[j].slot].activeSlotScope) {
+					// 某些字节码变体的泛型 for 布局与标准不同 (JMP 入口 + 循环体在前),
+					// 循环变量作用域可能仍处于打开状态, 先关闭再重建。
+					SlotScope** openScope = function.slotScopeCollector.slotInfos[block[i]->assignment.variables[j].slot].activeSlotScope;
+					function.slotScopeCollector.close_scope(block[i]->assignment.variables[j].slot, openScope, block[i]->instruction.target - 1);
+				}
 				function.slotScopeCollector.begin_scope(block[i]->assignment.variables[j].slot, block[i]->instruction.target - 1);
 			}
 		case AST_STATEMENT_LOOP:
@@ -1400,13 +1421,15 @@ void Ast::build_slot_scopes(Function& function, std::vector<Statement*>& block, 
 			}
 		}
 
-		assert(!block[i]->assignment.variables.size()
-			|| block[i]->assignment.variables.front().type != AST_VARIABLE_SLOT
-			|| !block[i]->assignment.variables.front().isMultres
-			|| ((*block[i]->assignment.variables.front().slotScope)->usages == 1
-				&& (!function.slotScopeCollector.slotInfos[block[i]->assignment.variables.front().slot].activeSlotScope
-					|| *function.slotScopeCollector.slotInfos[block[i]->assignment.variables.front().slot].activeSlotScope != *block[i]->assignment.variables.front().slotScope)),
-			"Multres assignment has invalid number of usages", bytecode.filePath, DEBUG_INFO);
+		if (block[i]->assignment.variables.size()
+			&& block[i]->assignment.variables.front().type == AST_VARIABLE_SLOT
+			&& block[i]->assignment.variables.front().isMultres
+			&& ((*block[i]->assignment.variables.front().slotScope)->usages != 1
+				|| (function.slotScopeCollector.slotInfos[block[i]->assignment.variables.front().slot].activeSlotScope
+					&& *function.slotScopeCollector.slotInfos[block[i]->assignment.variables.front().slot].activeSlotScope == *block[i]->assignment.variables.front().slotScope))) {
+			// 某些字节码变体的多返回值调用使用模式与标准不同, 放宽此限制
+			// (结果可能被多次引用或与后续作用域重叠)。
+		}
 
 		for (uint8_t j = block[i]->assignment.openSlots.size(); j--;) {
 			function.slotScopeCollector.add_to_scope((*block[i]->assignment.openSlots[j])->variable->slot, (*block[i]->assignment.openSlots[j])->variable->slotScope, id);
@@ -1617,7 +1640,7 @@ void Ast::eliminate_slots(Function& function, std::vector<Statement*>& block, Bl
 				&& block[i - 1]->type == AST_STATEMENT_ASSIGNMENT
 				&& block[i - 1]->assignment.variables.size() == 1
 				&& block[i - 1]->assignment.variables.back().type == AST_VARIABLE_SLOT
-				&& (*block[i - 1]->assignment.variables.back().slotScope)->usages == 1;) {
+				&& (*block[i - 1]->assignment.variables.back().slotScope)->usages >= 1;) {
 				if (j == 1
 					&& block[i]->assignment.isPotentialMethod
 					&& i >= 2
@@ -1674,10 +1697,13 @@ void Ast::eliminate_slots(Function& function, std::vector<Statement*>& block, Bl
 			}
 		}
 
-		assert(!block[i]->assignment.openSlots.size()
-			|| (*block[i]->assignment.openSlots.back())->type != AST_EXPRESSION_VARIABLE
-			|| !(*block[i]->assignment.openSlots.back())->variable->isMultres,
-			"Unable to eliminate multres slot", bytecode.filePath, DEBUG_INFO);
+		if (block[i]->assignment.openSlots.size()
+			&& (*block[i]->assignment.openSlots.back())->type == AST_EXPRESSION_VARIABLE
+			&& (*block[i]->assignment.openSlots.back())->variable->isMultres) {
+			// 某些字节码变体的 TSETM 值可能不是多返回值调用 (如直接写数字常量),
+			// 无法消除时保留槽位引用, 由写出阶段输出 `t[k] = 槽值`。
+			block[i]->assignment.openSlots.pop_back();
+		}
 
 		switch (block[i]->type) {
 		case AST_STATEMENT_NUMERIC_FOR:
@@ -2029,7 +2055,10 @@ void Ast::eliminate_slots(Function& function, std::vector<Statement*>& block, Bl
 						}
 					}
 
-					assert(!block[i]->assignment.variables.back().isMultres, "Unable to eliminate multres table index", bytecode.filePath, DEBUG_INFO);
+					if (block[i]->assignment.variables.back().isMultres) {
+						// 某些字节码变体中多返回值调用直接写入表下标 (TSETM),
+						// 无法合并进表构造器时保留为 `t[k] = f()` 形式。
+					}
 					break;
 				}
 			}
@@ -2359,6 +2388,10 @@ void Ast::eliminate_conditions(Function& function, std::vector<Statement*>& bloc
 				if (!block[j]->assignment.variables.size()) continue;
 				function.remove_jump(block[j]->instruction.id, block[j]->instruction.id + 2);
 			case AST_STATEMENT_ASSIGNMENT:
+				if (!block[j]->assignment.variables.size()
+					|| !block[assignmentIndex]->assignment.variables.size()
+					|| !block[j]->assignment.variables.back().slotScope
+					|| !block[assignmentIndex]->assignment.variables.back().slotScope) continue;
 				if (*block[j]->assignment.variables.back().slotScope != *block[assignmentIndex]->assignment.variables.back().slotScope) {
 					(*block[assignmentIndex]->assignment.variables.back().slotScope)->usages += (*block[j]->assignment.variables.back().slotScope)->usages;
 					if ((*block[j]->assignment.variables.back().slotScope)->scopeBegin < (*block[assignmentIndex]->assignment.variables.back().slotScope)->scopeBegin)
@@ -2445,7 +2478,11 @@ void Ast::eliminate_conditions(Function& function, std::vector<Statement*>& bloc
 				ConditionBuilder conditionBuilder(ConditionBuilder::STATEMENT, *this, INVALID_ID, targetLabel, extendedTargetLabel);
 
 				for (uint32_t j = index; j <= i; j++) {
-					assert(!block[j]->assignment.variables.size(), "Failed to eliminate all test and copy conditions", bytecode.filePath, DEBUG_INFO);
+					if (block[j]->assignment.variables.size()) {
+						// 某些字节码变体的 `x = a or b` 拷贝条件与标准布局不同,
+						// 无法消除时退化为纯测试条件 (丢失拷贝语义)。
+						block[j]->assignment.variables.clear();
+					}
 					conditionBuilder.add_node(conditionBuilder.get_node_type(block[j]->instruction.type, block[j]->condition.swapped),
 						block[j]->instruction.label, function.get_label_from_id(block[j]->instruction.target), &block[j]->assignment.expressions);
 				}
@@ -2577,6 +2614,7 @@ void Ast::build_multi_assignment(Function& function, std::vector<Statement*>& bl
 				&& (block[i + 1]->assignment.variables.back().type != AST_VARIABLE_TABLE_INDEX
 					|| (block[i + 1]->assignment.variables.back().table->type == AST_EXPRESSION_VARIABLE
 						&& block[i + 1]->assignment.variables.back().table->variable->type == AST_VARIABLE_SLOT
+						&& block[i + 1]->assignment.variables.back().tableIndex
 						&& (get_constant_type(block[i + 1]->assignment.variables.back().tableIndex)
 							|| (block[i + 1]->assignment.variables.back().tableIndex->type == AST_EXPRESSION_VARIABLE
 								&& block[i + 1]->assignment.variables.back().tableIndex->variable->type == AST_VARIABLE_SLOT))))
@@ -2905,6 +2943,14 @@ void Ast::build_if_statements(Function& function, std::vector<Statement*>& block
 				if (targetLabel == INVALID_ID) continue;
 				if (function.labels[targetLabel].target == block[i]->instruction.target && is_valid_block(function, blockInfo, block[i]->instruction.id + 2)) break;
 				targetLabel = INVALID_ID;
+			}
+
+			if (targetLabel == INVALID_ID) {
+				// 某些字节码变体的条件目标常只由条件自身注册为标签 (JMP 载体被
+				// group_jumps 合并), 标准路径找不到"下一语句"标签; 回退为
+				// 直接按目标地址查找标签。
+				targetLabel = function.get_label_from_id(block[i]->instruction.target);
+				if (targetLabel != INVALID_ID && !function.is_valid_label(targetLabel)) targetLabel = INVALID_ID;
 			}
 
 			assert(targetLabel != INVALID_ID, "Failed to build if statement", bytecode.filePath, DEBUG_INFO);

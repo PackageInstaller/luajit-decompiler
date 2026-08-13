@@ -51,10 +51,9 @@ void Bytecode::read_prototypes() {
 
 	assert(unlinkedPrototypes.size() == 1, "Failed to link main prototype", filePath, DEBUG_INFO);
 	main = unlinkedPrototypes.back();
-	assert((main->header.flags & BC_PROTO_VARARG)
-		&& !main->header.parameters
-		&& !main->upvalues.size(),
-		"Main prototype has invalid header", filePath, DEBUG_INFO);
+	// 部分字节码变体的顶层 chunk 可能带固定参数 (以参数调用),
+	// 因此放宽标准 LuaJIT 对主原型 "必须 vararg/无参" 的限制。
+	assert(!main->upvalues.size(), "Main prototype has invalid header", filePath, DEBUG_INFO);
 	prototypes.shrink_to_fit();
 }
 

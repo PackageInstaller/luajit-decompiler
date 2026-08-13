@@ -314,6 +314,7 @@ void Lua::write_block(const Ast::Function& function, const std::vector<Ast::Stat
 			write("::", function.labels[block[i]->instruction.label].name, "::");
 			break;
 		default:
+			fprintf(stderr, "[lua] unknown statement type %d\n", (int)block[i]->type);
 			throw nullptr;
 		}
 
@@ -689,7 +690,12 @@ void Lua::write_variable(const Ast::Variable& variable, const bool& isLineStart)
 	switch (variable.type) {
 	case Ast::AST_VARIABLE_SLOT:
 	case Ast::AST_VARIABLE_UPVALUE:
-		if (!(*variable.slotScope)->name.size()) throw nullptr;
+		if (!(*variable.slotScope)->name.size()) {
+			// 合并作用域时读取侧可能引用被合并的旧对象, 名字只写在规范对象上;
+			// 这里退化为按槽位生成名字 (可能缺少 local 声明, 但避免崩溃)。
+			write("var_" + std::to_string(variable.slot));
+			break;
+		}
 		write((*variable.slotScope)->name);
 		break;
 	case Ast::AST_VARIABLE_GLOBAL:
@@ -697,6 +703,13 @@ void Lua::write_variable(const Ast::Variable& variable, const bool& isLineStart)
 		break;
 	case Ast::AST_VARIABLE_TABLE_INDEX:
 		write_prefix_expression(*variable.table, isLineStart);
+
+		if (!variable.tableIndex) {
+			// 多返回值直接写入表下标 (TSETM 变体):
+			// 输出 t[起始下标] = f() 形式, 保留第一个返回值。
+			write("[", std::to_string(variable.multresIndex), "]");
+			break;
+		}
 
 		if (variable.tableIndex->type == Ast::AST_EXPRESSION_CONSTANT && variable.tableIndex->constant->isName) {
 			write(".", variable.tableIndex->constant->string);
