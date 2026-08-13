@@ -2951,6 +2951,22 @@ void Ast::build_if_statements(Function& function, std::vector<Statement*>& block
 				// 直接按目标地址查找标签。
 				targetLabel = function.get_label_from_id(block[i]->instruction.target);
 				if (targetLabel != INVALID_ID && !function.is_valid_label(targetLabel)) targetLabel = INVALID_ID;
+
+				if (targetLabel != INVALID_ID) {
+					// 标准路径失败时 index 会停在 block.size(), 直接用会越界;
+					// 按目标地址/标签重新定位承载语句, 其前一条语句作为 if 体终点。
+					index = block.size() - 1;
+
+					for (uint32_t j = i + 1; j < block.size(); j++) {
+						if (block[j]->instruction.id == block[i]->instruction.target
+							|| block[j]->instruction.label == targetLabel) {
+							index = j - 1;
+							break;
+						}
+					}
+
+					if (index < i) index = i;
+				}
 			}
 
 			assert(targetLabel != INVALID_ID, "Failed to build if statement", bytecode.filePath, DEBUG_INFO);
