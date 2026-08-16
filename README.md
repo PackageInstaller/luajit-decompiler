@@ -71,6 +71,11 @@ C++23 项目：
 - 接受字节码头中的 `BCDUMP_F_BITOP`（0x10）与原型标志
   `PROTO_BITOP`（0x80）。
 
+### v2.0.5  大端字节码支持
+
+- 支持 `BCDUMP_F_BE`（0x01）标志，按 dump 端序读取指令、upvalue 引用与
+  多字节行号，可反编译大端 LuaJIT 字节码。
+
 ## 构建
 
 要求：支持 C++23 的编译器（GCC 13 或 Clang 16 以上）、CMake 3.20 以上。
@@ -106,7 +111,6 @@ build/luajit-decompiler INPUT_PATH [选项]
 
 ## 已知限制
 
-- 大端字节码（big endian）暂不支持；
 - 条件赋值（conditional assignment）的反编译输出仍可能不够理想；
 
 ## 参考

@@ -31,7 +31,33 @@ void Bytecode::Prototype::read_header() {
 
 void Bytecode::Prototype::read_instructions() {
 	for (uint32_t i = 0; i < instructions.size(); i++) {
-		instructions[i].type = get_op_type(get_next_byte(), bytecode.header.version);
+		if (bytecode.header.flags & BC_F_BE) {
+			const uint8_t raw0 = get_next_byte();
+			const uint8_t raw1 = get_next_byte();
+			const uint8_t raw2 = get_next_byte();
+			const uint8_t raw3 = get_next_byte();
+			instructions[i].type = get_op_type(raw3, bytecode.header.version);
+			instructions[i].a = raw2;
+
+			if (is_op_abc_format(instructions[i].type)) {
+				instructions[i].c = raw1;
+				instructions[i].b = raw0;
+			} else {
+				instructions[i].d = (uint16_t)raw0 << 8 | raw1;
+			}
+		} else {
+			instructions[i].type = get_op_type(get_next_byte(), bytecode.header.version);
+			instructions[i].a = get_next_byte();
+
+			if (is_op_abc_format(instructions[i].type)) {
+				instructions[i].c = get_next_byte();
+				instructions[i].b = get_next_byte();
+			} else {
+				instructions[i].d = get_next_byte();
+				instructions[i].d |= (uint16_t)get_next_byte() << 8;
+			}
+		}
+
 		assert(instructions[i].type < BC_OP_INVALID, "Prototype has invalid instruction (" + byte_to_string(instructions[i].type) + ")", bytecode.filePath, DEBUG_INFO);
 
 		switch (instructions[i].type) {
@@ -57,22 +83,16 @@ void Bytecode::Prototype::read_instructions() {
 			assert(false, "Prototype has unsupported instruction (" + byte_to_string(instructions[i].type) + ")", bytecode.filePath, DEBUG_INFO);
 		}
 
-		instructions[i].a = get_next_byte();
-
-		if (is_op_abc_format(instructions[i].type)) {
-			instructions[i].c = get_next_byte();
-			instructions[i].b = get_next_byte();
-		} else {
-			instructions[i].d = get_next_byte();
-			instructions[i].d |= (uint16_t)get_next_byte() << 8;
-		}
 	}
 }
 
 void Bytecode::Prototype::read_upvalues() {
 	for (uint8_t i = 0; i < upvalues.size(); i++) {
-		upvalues[i] = get_next_byte();
-		upvalues[i] |= (uint16_t)get_next_byte() << 8;
+		const uint8_t low = get_next_byte();
+		const uint8_t high = get_next_byte();
+		upvalues[i] = bytecode.header.flags & BC_F_BE
+			? (uint16_t)low << 8 | high
+			: (uint16_t)high << 8 | low;
 	}
 }
 
@@ -148,15 +168,21 @@ void Bytecode::Prototype::read_debug_info() {
 		}
 	} else if (header.lineCount < 65536) {
 		for (uint32_t i = 0; i < lineMap.size(); i++) {
-			lineMap[i] = get_next_byte();
-			lineMap[i] |= (uint16_t)get_next_byte() << 8;
+			const uint8_t first = get_next_byte();
+			const uint8_t second = get_next_byte();
+			lineMap[i] = bytecode.header.flags & BC_F_BE
+				? (uint32_t)first << 8 | second
+				: (uint32_t)second << 8 | first;
 		}
 	} else {
 		for (uint32_t i = 0; i < lineMap.size(); i++) {
-			lineMap[i] = get_next_byte();
-			lineMap[i] |= (uint32_t)get_next_byte() << 8;
-			lineMap[i] |= (uint32_t)get_next_byte() << 16;
-			lineMap[i] |= (uint32_t)get_next_byte() << 24;
+			const uint8_t byte0 = get_next_byte();
+			const uint8_t byte1 = get_next_byte();
+			const uint8_t byte2 = get_next_byte();
+			const uint8_t byte3 = get_next_byte();
+			lineMap[i] = bytecode.header.flags & BC_F_BE
+				? (uint32_t)byte0 << 24 | (uint32_t)byte1 << 16 | (uint32_t)byte2 << 8 | byte3
+				: (uint32_t)byte3 << 24 | (uint32_t)byte2 << 16 | (uint32_t)byte1 << 8 | byte0;
 		}
 	}
 
