@@ -63,6 +63,8 @@ private:
 	void clean_up(Function& function);
 	void clean_up_block(Function& function, std::vector<Statement*>& block, uint32_t& variableCounter, uint32_t& iteratorCounter, BlockInfo* const& previousBlock);
 	void fixup_labels(Function& function);
+	void optimize_conditional_assignments(Function& function);
+	void optimize_conditional_assignments(Function& function, std::vector<Statement*>& block);
 	Expression* new_slot(const uint8_t& slot);
 	Expression* new_literal(const uint8_t& literal);
 	Expression* new_signed_literal(const uint16_t& signedLiteral);
@@ -77,6 +79,8 @@ private:
 	static uint32_t get_label_from_next_statement(Function& function, const BlockInfo& blockInfo, const bool& returnExtendedLabel, const bool& excludeDeclaration);
 	static bool is_valid_block(Function& function, const BlockInfo& blockInfo, const uint32_t& blockBegin);
 	static void check_valid_name(Constant* const& constant);
+	static bool expressions_equal(const Expression& a, const Expression& b);
+	static bool expression_matches_variable(const Expression& expression, const Variable& variable);
 	void check_special_number(Expression* const& expression, const bool& isCdata = false);
 	static CONSTANT_TYPE get_constant_type(Expression* const& expression);
 

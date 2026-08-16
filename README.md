@@ -76,6 +76,12 @@ C++23 项目：
 - 支持 `BCDUMP_F_BE`（0x01）标志，按 dump 端序读取指令、upvalue 引用与
   多字节行号，可反编译大端 LuaJIT 字节码。
 
+### v2.0.6  条件赋值输出优化
+
+- 识别 `local x; if not y then x = d end` 这类丢失初始读值的模式，
+  还原为 `local x = y or d`；若变量随后直接写回同一目标，则进一步内联为
+  `target = target or d`。
+
 ## 构建
 
 要求：支持 C++23 的编译器（GCC 13 或 Clang 16 以上）、CMake 3.20 以上。
@@ -111,7 +117,7 @@ build/luajit-decompiler INPUT_PATH [选项]
 
 ## 已知限制
 
-- 条件赋值（conditional assignment）的反编译输出仍可能不够理想；
+- 部分复杂条件赋值（多分支、多路径）仍可能输出为 if 形式；
 
 ## 参考
 

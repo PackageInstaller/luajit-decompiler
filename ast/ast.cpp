@@ -3050,6 +3050,7 @@ void Ast::clean_up(Function& function) {
 
 	uint32_t variableCounter = 0, iteratorCounter = 0;
 	clean_up_block(function, function.block, variableCounter, iteratorCounter, nullptr);
+	optimize_conditional_assignments(function);
 
 	for (uint32_t i = 0, labelCounter = 0; i < function.labels.size(); i++) {
 		if (!function.labels[i].jumpIds.size()) continue;
@@ -3203,6 +3204,144 @@ void Ast::fixup_labels(Function& function) {
 			else ++it;
 		}
 		targetBlock.insert(targetBlock.begin() + earliestGoto, declarations.begin(), declarations.end());
+	}
+}
+
+bool Ast::expressions_equal(const Expression& a, const Expression& b) {
+	if (a.type != b.type) return false;
+
+	switch (a.type) {
+	case AST_EXPRESSION_CONSTANT:
+		if (a.constant->type != b.constant->type) return false;
+		switch (a.constant->type) {
+		case AST_CONSTANT_NIL:
+		case AST_CONSTANT_FALSE:
+		case AST_CONSTANT_TRUE:
+			return true;
+		case AST_CONSTANT_NUMBER:
+			return a.constant->number == b.constant->number;
+		case AST_CONSTANT_CDATA_SIGNED:
+			return a.constant->signed_integer == b.constant->signed_integer;
+		case AST_CONSTANT_CDATA_UNSIGNED:
+		case AST_CONSTANT_CDATA_IMAGINARY:
+			return a.constant->unsigned_integer == b.constant->unsigned_integer;
+		case AST_CONSTANT_STRING:
+			return a.constant->string == b.constant->string;
+		}
+		break;
+	case AST_EXPRESSION_VARIABLE:
+		if (a.variable->type != b.variable->type) return false;
+		switch (a.variable->type) {
+		case AST_VARIABLE_SLOT:
+			return a.variable->slot == b.variable->slot;
+		case AST_VARIABLE_UPVALUE:
+			return a.variable->slotScope == b.variable->slotScope;
+		case AST_VARIABLE_GLOBAL:
+			return a.variable->name == b.variable->name;
+		case AST_VARIABLE_TABLE_INDEX:
+			return expressions_equal(*a.variable->table, *b.variable->table)
+				&& expressions_equal(*a.variable->tableIndex, *b.variable->tableIndex);
+		}
+		break;
+	case AST_EXPRESSION_UNARY_OPERATION:
+		return a.unaryOperation->type == b.unaryOperation->type
+			&& expressions_equal(*a.unaryOperation->operand, *b.unaryOperation->operand);
+	case AST_EXPRESSION_BINARY_OPERATION:
+		return a.binaryOperation->type == b.binaryOperation->type
+			&& expressions_equal(*a.binaryOperation->leftOperand, *b.binaryOperation->leftOperand)
+			&& expressions_equal(*a.binaryOperation->rightOperand, *b.binaryOperation->rightOperand);
+	default:
+		break;
+	}
+
+	return false;
+}
+
+bool Ast::expression_matches_variable(const Expression& expression, const Variable& variable) {
+	if (expression.type != AST_EXPRESSION_VARIABLE) return false;
+
+	switch (variable.type) {
+	case AST_VARIABLE_SLOT:
+		return expression.variable->type == AST_VARIABLE_SLOT && expression.variable->slot == variable.slot;
+	case AST_VARIABLE_UPVALUE:
+		return expression.variable->type == AST_VARIABLE_UPVALUE && expression.variable->slotScope == variable.slotScope;
+	case AST_VARIABLE_GLOBAL:
+		return expression.variable->type == AST_VARIABLE_GLOBAL && expression.variable->name == variable.name;
+	case AST_VARIABLE_TABLE_INDEX:
+		return expression.variable->type == AST_VARIABLE_TABLE_INDEX
+			&& expressions_equal(*expression.variable->table, *variable.table)
+			&& expressions_equal(*expression.variable->tableIndex, *variable.tableIndex);
+	}
+
+	return false;
+}
+
+void Ast::optimize_conditional_assignments(Function& function) {
+	optimize_conditional_assignments(function, function.block);
+}
+
+void Ast::optimize_conditional_assignments(Function& function, std::vector<Statement*>& block) {
+	for (Statement* statement : block) {
+		if (statement && !statement->block.empty()) optimize_conditional_assignments(function, statement->block);
+	}
+
+	for (uint32_t i = 0; i + 1 < block.size(); i++) {
+		Statement* declaration = block[i];
+		Statement* ifStatement = block[i + 1];
+
+		if (!declaration || !ifStatement) continue;
+		if (declaration->type != AST_STATEMENT_DECLARATION
+			|| ifStatement->type != AST_STATEMENT_IF)
+			continue;
+		if (i + 2 < block.size() && block[i + 2]->type == AST_STATEMENT_ELSE) continue;
+		if (declaration->assignment.variables.size() != 1
+			|| declaration->assignment.expressions.size() != 0)
+			continue;
+
+		const uint8_t variableSlot = declaration->assignment.variables.back().slot;
+		if (ifStatement->assignment.expressions.size() != 1
+			|| ifStatement->assignment.expressions.back()->type != AST_EXPRESSION_UNARY_OPERATION
+			|| ifStatement->assignment.expressions.back()->unaryOperation->type != AST_UNARY_NOT
+			|| ifStatement->block.size() != 1)
+			continue;
+
+		Expression* conditionOperand = ifStatement->assignment.expressions.back()->unaryOperation->operand;
+		Statement* innerAssignment = ifStatement->block.front();
+		if (!innerAssignment
+			|| innerAssignment->type != AST_STATEMENT_ASSIGNMENT
+			|| innerAssignment->assignment.variables.size() != 1
+			|| innerAssignment->assignment.variables.back().type != AST_VARIABLE_SLOT
+			|| innerAssignment->assignment.variables.back().slot != variableSlot
+			|| innerAssignment->assignment.expressions.size() != 1)
+			continue;
+
+		Expression* defaultValue = innerAssignment->assignment.expressions.back();
+
+		Expression* orExpression = new_expression(AST_EXPRESSION_BINARY_OPERATION);
+		orExpression->binaryOperation->type = AST_BINARY_OR;
+		orExpression->binaryOperation->leftOperand = conditionOperand;
+		orExpression->binaryOperation->rightOperand = defaultValue;
+		declaration->assignment.expressions.clear();
+		declaration->assignment.expressions.emplace_back(orExpression);
+		block.erase(block.begin() + i + 1);
+
+		// 若变量紧随其后被直接赋值给同一目标，则进一步内联为 `target = target or default`。
+		if (i + 1 < block.size()) {
+			Statement* assignment = block[i + 1];
+			if (assignment
+				&& assignment->type == AST_STATEMENT_ASSIGNMENT
+				&& assignment->assignment.variables.size() == 1
+				&& assignment->assignment.expressions.size() == 1
+				&& assignment->assignment.expressions.back()->type == AST_EXPRESSION_VARIABLE
+				&& assignment->assignment.expressions.back()->variable->type == AST_VARIABLE_SLOT
+				&& assignment->assignment.expressions.back()->variable->slot == variableSlot
+				&& expression_matches_variable(*conditionOperand, assignment->assignment.variables.back())) {
+				assignment->assignment.expressions.back() = orExpression;
+				block.erase(block.begin() + i);
+			}
+		}
+
+		i = i ? i - 1 : 0;
 	}
 }
 
