@@ -61,6 +61,16 @@ C++23 项目：
   导致的死循环（改为 32 位下标）；
 - 增加空变量、空 tableIndex、空 slotScope 的防御性检查。
 
+### v2.0.4  位运算 AST 反编译
+
+- 实现 LuaJIT 2.1 新增的 7 个位运算指令（`BNOT`、`BAND`、`BOR`、`BXOR`、
+  `BSHL`、`BSHR`、`BSAR`）的 AST 反编译输出：
+  - 一元按位取反：`~x`
+  - 按位与/或/异或：`a & b`、`a | b`、`a ~ b`
+  - 左移/右移/算术右移：`a << b`、`a >> b`、`a ~>> b`
+- 接受字节码头中的 `BCDUMP_F_BITOP`（0x10）与原型标志
+  `PROTO_BITOP`（0x80）。
+
 ## 构建
 
 要求：支持 C++23 的编译器（GCC 13 或 Clang 16 以上）、CMake 3.20 以上。
@@ -98,8 +108,6 @@ build/luajit-decompiler INPUT_PATH [选项]
 
 - 大端字节码（big endian）暂不支持；
 - 条件赋值（conditional assignment）的反编译输出仍可能不够理想；
-- 新增的 7 个位运算指令仅保证指令表对齐与指令解码正确，尚未实现 AST
-  反编译输出（遇到会按不支持处理）。
 
 ## 参考
 

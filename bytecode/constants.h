@@ -5,9 +5,11 @@ static constexpr uint8_t BC_F_BE = 0x01;
 static constexpr uint8_t BC_F_STRIP = 0x02;
 static constexpr uint8_t BC_F_FFI = 0x04;
 static constexpr uint8_t BC_F_FR2 = 0x08;
+static constexpr uint8_t BC_F_BITOP = 0x10;
 static constexpr uint8_t BC_PROTO_CHILD = 0x01;
 static constexpr uint8_t BC_PROTO_VARARG = 0x02;
 static constexpr uint8_t BC_PROTO_FFI = 0x04;
+static constexpr uint8_t BC_PROTO_BITOP = 0x80;
 static constexpr uint16_t BC_UV_IMMUTABLE = 0x4000;
 static constexpr uint16_t BC_UV_LOCAL = 0x8000;
 

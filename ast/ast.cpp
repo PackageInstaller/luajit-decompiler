@@ -472,6 +472,7 @@ void Ast::build_expressions(Function& function, std::vector<Statement*>& block) 
 			case Bytecode::BC_OP_NOT:
 			case Bytecode::BC_OP_UNM:
 			case Bytecode::BC_OP_LEN:
+			case Bytecode::BC_OP_BNOT:
 				block[i]->assignment.expressions.back() = new_expression(AST_EXPRESSION_UNARY_OPERATION);
 
 				switch (block[i]->instruction.type) {
@@ -485,6 +486,10 @@ void Ast::build_expressions(Function& function, std::vector<Statement*>& block) 
 					break;
 				case Bytecode::BC_OP_LEN:
 					block[i]->assignment.expressions.back()->unaryOperation->type = AST_UNARY_LENGTH;
+					break;
+				case Bytecode::BC_OP_BNOT:
+					block[i]->assignment.expressions.back()->unaryOperation->type = AST_UNARY_BIT_NOT;
+					block[i]->assignment.allowedConstantType = INVALID_CONSTANT;
 					break;
 				}
 
@@ -507,6 +512,12 @@ void Ast::build_expressions(Function& function, std::vector<Statement*>& block) 
 			case Bytecode::BC_OP_DIVVV:
 			case Bytecode::BC_OP_MODVV:
 			case Bytecode::BC_OP_POW:
+			case Bytecode::BC_OP_BAND:
+			case Bytecode::BC_OP_BOR:
+			case Bytecode::BC_OP_BXOR:
+			case Bytecode::BC_OP_BSHL:
+			case Bytecode::BC_OP_BSHR:
+			case Bytecode::BC_OP_BSAR:
 				block[i]->assignment.allowedConstantType = BOOL_CONSTANT;
 			case Bytecode::BC_OP_CAT:
 				block[i]->assignment.expressions.back() = new_expression(AST_EXPRESSION_BINARY_OPERATION);
@@ -543,6 +554,24 @@ void Ast::build_expressions(Function& function, std::vector<Statement*>& block) 
 				case Bytecode::BC_OP_CAT:
 					block[i]->assignment.expressions.back()->binaryOperation->type = AST_BINARY_CONCATENATION;
 					break;
+				case Bytecode::BC_OP_BAND:
+					block[i]->assignment.expressions.back()->binaryOperation->type = AST_BINARY_BIT_AND;
+					break;
+				case Bytecode::BC_OP_BOR:
+					block[i]->assignment.expressions.back()->binaryOperation->type = AST_BINARY_BIT_OR;
+					break;
+				case Bytecode::BC_OP_BXOR:
+					block[i]->assignment.expressions.back()->binaryOperation->type = AST_BINARY_BIT_XOR;
+					break;
+				case Bytecode::BC_OP_BSHL:
+					block[i]->assignment.expressions.back()->binaryOperation->type = AST_BINARY_SHIFT_LEFT;
+					break;
+				case Bytecode::BC_OP_BSHR:
+					block[i]->assignment.expressions.back()->binaryOperation->type = AST_BINARY_SHIFT_RIGHT;
+					break;
+				case Bytecode::BC_OP_BSAR:
+					block[i]->assignment.expressions.back()->binaryOperation->type = AST_BINARY_SHIFT_RIGHT_ARITHMETIC;
+					break;
 				}
 
 				switch (block[i]->instruction.type) {
@@ -570,6 +599,12 @@ void Ast::build_expressions(Function& function, std::vector<Statement*>& block) 
 				case Bytecode::BC_OP_DIVVV:
 				case Bytecode::BC_OP_MODVV:
 				case Bytecode::BC_OP_POW:
+				case Bytecode::BC_OP_BAND:
+				case Bytecode::BC_OP_BOR:
+				case Bytecode::BC_OP_BXOR:
+				case Bytecode::BC_OP_BSHL:
+				case Bytecode::BC_OP_BSHR:
+				case Bytecode::BC_OP_BSAR:
 					block[i]->assignment.expressions.back()->binaryOperation->leftOperand = new_slot(block[i]->instruction.b);
 					block[i]->assignment.expressions.back()->binaryOperation->rightOperand = new_slot(block[i]->instruction.c);
 					block[i]->assignment.register_slots(block[i]->assignment.expressions.back()->binaryOperation->leftOperand, block[i]->assignment.expressions.back()->binaryOperation->rightOperand);
@@ -1645,6 +1680,7 @@ void Ast::eliminate_slots(Function& function, std::vector<Statement*>& block, Bl
 					&& block[i]->assignment.isPotentialMethod
 					&& i >= 2
 					&& !function.is_valid_label(block[i - 1]->instruction.label)
+					&& !function.is_valid_label(block[i - 2]->instruction.label)
 					&& block[i - 1]->assignment.variables.back().slot == (*block[i]->assignment.openSlots.front())->variable->slot
 					&& block[i - 1]->assignment.expressions.back()->type == AST_EXPRESSION_VARIABLE
 					&& block[i - 1]->assignment.expressions.back()->variable->type == AST_VARIABLE_TABLE_INDEX
@@ -1657,9 +1693,10 @@ void Ast::eliminate_slots(Function& function, std::vector<Statement*>& block, Bl
 					&& block[i - 2]->assignment.variables.back().type == AST_VARIABLE_SLOT
 					&& (*block[i - 2]->assignment.variables.back().slotScope)->usages == 1
 					&& block[i - 2]->assignment.variables.back().slot == (*block[i]->assignment.openSlots[j])->variable->slot
+					&& block[i - 2]->assignment.expressions.size() == 1
 					&& block[i - 2]->assignment.expressions.back()->type == AST_EXPRESSION_VARIABLE
-					&& block[i - 2]->assignment.expressions.back()->variable->type == AST_VARIABLE_SLOT
-					&& block[i - 2]->assignment.expressions.back()->variable->slot == block[i - 1]->assignment.expressions.back()->variable->table->variable->slot) {
+					&& block[i - 2]->assignment.expressions.back()->variable->type != AST_VARIABLE_TABLE_INDEX) {
+					block[i - 1]->assignment.expressions.back()->variable->table = block[i - 2]->assignment.expressions.back();
 					if (block[i]->type == AST_STATEMENT_RETURN) {
 						block[i]->assignment.multresReturn->functionCall->isMethod = true;
 						block[i]->assignment.multresReturn->functionCall->arguments.erase(block[i]->assignment.multresReturn->functionCall->arguments.begin());
@@ -1672,7 +1709,10 @@ void Ast::eliminate_slots(Function& function, std::vector<Statement*>& block, Bl
 					block[i]->assignment.openSlots.emplace(block[i]->assignment.openSlots.begin(), &block[i - 1]->assignment.expressions.back()->variable->table);
 					function.slotScopeCollector.remove_scope(block[i - 2]->assignment.variables.back().slot, block[i - 2]->assignment.variables.back().slotScope);
 					block[i - 1]->instruction.label = block[i - 2]->instruction.label;
-					(*block[i - 2]->assignment.expressions.back()->variable->slotScope)->usages--;
+					if (block[i - 2]->assignment.expressions.back()->type == AST_EXPRESSION_VARIABLE
+						&& block[i - 2]->assignment.expressions.back()->variable->type == AST_VARIABLE_SLOT) {
+						(*block[i - 2]->assignment.expressions.back()->variable->slotScope)->usages--;
+					}
 					i--;
 					block.erase(block.begin() + i - 1);
 				}

@@ -556,6 +556,12 @@ void Lua::write_expression(const Ast::Expression& expression, const bool& usePar
 		operandPrecedence = get_operator_precedence(*expression.binaryOperation->leftOperand);
 		parentheses = false;
 
+		if (expression.binaryOperation->type >= Ast::AST_BINARY_BIT_AND
+			&& expression.binaryOperation->type <= Ast::AST_BINARY_SHIFT_RIGHT_ARITHMETIC
+			&& (expression.binaryOperation->leftOperand->type == Ast::AST_EXPRESSION_BINARY_OPERATION
+				|| expression.binaryOperation->leftOperand->type == Ast::AST_EXPRESSION_UNARY_OPERATION))
+			parentheses = true;
+
 		if (operandPrecedence == operatorPrecedence) {
 			switch (operandPrecedence) {
 			case 3:
@@ -624,9 +630,33 @@ void Lua::write_expression(const Ast::Expression& expression, const bool& usePar
 		case Ast::AST_BINARY_OR:
 			write(" or ");
 			break;
+		case Ast::AST_BINARY_BIT_AND:
+			write(" & ");
+			break;
+		case Ast::AST_BINARY_BIT_OR:
+			write(" | ");
+			break;
+		case Ast::AST_BINARY_BIT_XOR:
+			write(" ~ ");
+			break;
+		case Ast::AST_BINARY_SHIFT_LEFT:
+			write(" << ");
+			break;
+		case Ast::AST_BINARY_SHIFT_RIGHT:
+			write(" >> ");
+			break;
+		case Ast::AST_BINARY_SHIFT_RIGHT_ARITHMETIC:
+			write(" ~>> ");
+			break;
 		}
 
 		parentheses = false;
+
+		if (expression.binaryOperation->type >= Ast::AST_BINARY_BIT_AND
+			&& expression.binaryOperation->type <= Ast::AST_BINARY_SHIFT_RIGHT_ARITHMETIC
+			&& (expression.binaryOperation->rightOperand->type == Ast::AST_EXPRESSION_BINARY_OPERATION
+				|| expression.binaryOperation->rightOperand->type == Ast::AST_EXPRESSION_UNARY_OPERATION))
+			parentheses = true;
 
 		if (expression.binaryOperation->rightOperand->type == Ast::AST_EXPRESSION_BINARY_OPERATION) {
 			operandPrecedence = get_operator_precedence(*expression.binaryOperation->rightOperand);
@@ -661,6 +691,9 @@ void Lua::write_expression(const Ast::Expression& expression, const bool& usePar
 			break;
 		case Ast::AST_UNARY_LENGTH:
 			write("#");
+			break;
+		case Ast::AST_UNARY_BIT_NOT:
+			write("~");
 			break;
 		}
 
@@ -1004,6 +1037,15 @@ uint8_t Lua::get_operator_precedence(const Ast::Expression& expression) {
 			return 1;
 		case Ast::AST_BINARY_OR:
 			return 0;
+		case Ast::AST_BINARY_BIT_AND:
+		case Ast::AST_BINARY_SHIFT_LEFT:
+		case Ast::AST_BINARY_SHIFT_RIGHT:
+		case Ast::AST_BINARY_SHIFT_RIGHT_ARITHMETIC:
+			return 4;
+		case Ast::AST_BINARY_BIT_XOR:
+			return 3;
+		case Ast::AST_BINARY_BIT_OR:
+			return 2;
 		}
 	case Ast::AST_EXPRESSION_UNARY_OPERATION:
 		return 6;

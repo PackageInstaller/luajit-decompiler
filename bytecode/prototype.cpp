@@ -15,7 +15,7 @@ void Bytecode::Prototype::operator()(std::vector<Prototype*>& unlinkedPrototypes
 
 void Bytecode::Prototype::read_header() {
 	header.flags = get_next_byte();
-	assert(!(header.flags & ~(BC_PROTO_CHILD | BC_PROTO_VARARG | BC_PROTO_FFI)), "Prototype has invalid flags (" + byte_to_string(header.flags) + ")", bytecode.filePath, DEBUG_INFO);
+	assert(!(header.flags & ~(BC_PROTO_CHILD | BC_PROTO_VARARG | BC_PROTO_FFI | BC_PROTO_BITOP)), "Prototype has invalid flags (" + byte_to_string(header.flags) + ")", bytecode.filePath, DEBUG_INFO);
 	header.parameters = get_next_byte();
 	header.framesize = get_next_byte();
 	upvalues.resize(get_next_byte());
