@@ -62,6 +62,7 @@ private:
 	void build_if_statements(Function& function, std::vector<Statement*>& block, BlockInfo* const& previousBlock);
 	void clean_up(Function& function);
 	void clean_up_block(Function& function, std::vector<Statement*>& block, uint32_t& variableCounter, uint32_t& iteratorCounter, BlockInfo* const& previousBlock);
+	void fixup_labels(Function& function);
 	Expression* new_slot(const uint8_t& slot);
 	Expression* new_literal(const uint8_t& literal);
 	Expression* new_signed_literal(const uint16_t& signedLiteral);

@@ -69,6 +69,7 @@ void Ast::build_functions(Function& function, uint32_t& functionCounter) {
 	eliminate_conditions(function, function.block, nullptr);
 	build_if_statements(function, function.block, nullptr);
 	clean_up(function);
+	fixup_labels(function);
 	function.block.shrink_to_fit();
 	prototypeDataLeft -= function.prototype.prototypeSize;
 	print_progress_bar(bytecode.prototypesTotalSize - prototypeDataLeft, bytecode.prototypesTotalSize);
@@ -3054,6 +3055,154 @@ void Ast::clean_up(Function& function) {
 		if (!function.labels[i].jumpIds.size()) continue;
 		function.labels[i].name = "label_" + std::to_string(minimizeDiffs ? function.level : function.id) + "_" + std::to_string(labelCounter);
 		labelCounter++;
+	}
+}
+
+void Ast::fixup_labels(Function& function) {
+	std::unordered_map<Statement*, Statement*> parent;
+	std::unordered_map<uint32_t, Statement*> labelStatements;
+	std::unordered_map<uint32_t, std::vector<Statement*>> gotoStatements;
+
+	std::vector<std::pair<std::vector<Statement*>*, Statement*>> stack;
+	stack.push_back({ &function.block, nullptr });
+
+	while (!stack.empty()) {
+		const auto [block, owner] = stack.back();
+		stack.pop_back();
+
+		for (Statement* statement : *block) {
+			if (!statement) continue;
+			parent[statement] = owner;
+
+			if (statement->type == AST_STATEMENT_LABEL) {
+				const uint32_t label = statement->instruction.label;
+				if (function.is_valid_label(label)) labelStatements[label] = statement;
+			} else if (statement->type == AST_STATEMENT_GOTO) {
+				const uint32_t label = statement->instruction.label;
+				if (function.is_valid_label(label)) gotoStatements[label].push_back(statement);
+			}
+
+			if (!statement->block.empty()) stack.push_back({ &statement->block, statement });
+		}
+	}
+
+	const auto isDescendant = [&](Statement* ancestor, Statement* target) -> bool {
+		for (Statement* current = target; current; current = parent[current]) {
+			if (current == ancestor) return true;
+		}
+		return false;
+	};
+
+	for (const auto& [label, labelStatement] : labelStatements) {
+		const auto gotoIt = gotoStatements.find(label);
+		if (gotoIt == gotoStatements.end() || gotoIt->second.empty()) continue;
+		const auto& gotos = gotoIt->second;
+
+		Statement* labelBlock = parent[labelStatement];
+		// 计算所有引用该 label 的 GOTO 以及 label 自身所在块的最近公共祖先块。
+		Statement* commonBlock = parent[gotos.front()];
+		while (commonBlock && !isDescendant(commonBlock, labelBlock)) {
+			commonBlock = parent[commonBlock];
+		}
+		for (size_t i = 1; i < gotos.size(); i++) {
+			Statement* gotoBlock = parent[gotos[i]];
+			while (commonBlock && !isDescendant(commonBlock, gotoBlock)) {
+				commonBlock = parent[commonBlock];
+			}
+		}
+
+		if (labelBlock == commonBlock) continue;
+
+		std::vector<Statement*>& targetBlock = commonBlock ? commonBlock->block : function.block;
+		size_t insertIndex = targetBlock.size();
+
+		for (size_t i = 0; i < targetBlock.size(); i++) {
+			if (isDescendant(targetBlock[i], labelStatement)) {
+				insertIndex = i;
+				break;
+			}
+		}
+
+		if (insertIndex == targetBlock.size()) continue;
+
+		std::vector<Statement*>& oldBlock = labelBlock ? labelBlock->block : function.block;
+		for (auto it = oldBlock.begin(); it != oldBlock.end(); ++it) {
+			if (*it == labelStatement) {
+				oldBlock.erase(it);
+				break;
+			}
+		}
+
+		targetBlock.insert(targetBlock.begin() + insertIndex, labelStatement);
+		parent[labelStatement] = commonBlock;
+	}
+
+	// 第二遍：处理 goto 跳过局部变量声明的问题。
+	// label 提升后，把位于 goto 与 label 之间的 DECLARATION 移到 goto 之前。
+	parent.clear();
+	labelStatements.clear();
+	gotoStatements.clear();
+	stack.clear();
+	stack.push_back({ &function.block, nullptr });
+
+	while (!stack.empty()) {
+		const auto [block, owner] = stack.back();
+		stack.pop_back();
+
+		for (Statement* statement : *block) {
+			if (!statement) continue;
+			parent[statement] = owner;
+
+			if (statement->type == AST_STATEMENT_LABEL) {
+				const uint32_t label = statement->instruction.label;
+				if (function.is_valid_label(label)) labelStatements[label] = statement;
+			} else if (statement->type == AST_STATEMENT_GOTO) {
+				const uint32_t label = statement->instruction.label;
+				if (function.is_valid_label(label)) gotoStatements[label].push_back(statement);
+			}
+
+			if (!statement->block.empty()) stack.push_back({ &statement->block, statement });
+		}
+	}
+
+	for (const auto& [label, labelStatement] : labelStatements) {
+		const auto gotoIt = gotoStatements.find(label);
+		if (gotoIt == gotoStatements.end() || gotoIt->second.empty()) continue;
+
+		Statement* labelBlock = parent[labelStatement];
+		std::vector<Statement*>& targetBlock = labelBlock ? labelBlock->block : function.block;
+		size_t labelIndex = targetBlock.size();
+		for (size_t i = 0; i < targetBlock.size(); i++) {
+			if (targetBlock[i] == labelStatement) {
+				labelIndex = i;
+				break;
+			}
+		}
+		if (labelIndex == targetBlock.size()) continue;
+
+		size_t earliestGoto = labelIndex;
+		for (Statement* gotoStatement : gotoIt->second) {
+			for (size_t i = 0; i < targetBlock.size(); i++) {
+				if (isDescendant(targetBlock[i], gotoStatement)) {
+					if (i < earliestGoto) earliestGoto = i;
+					break;
+				}
+			}
+		}
+
+		if (earliestGoto >= labelIndex) continue;
+
+		std::vector<Statement*> declarations;
+		for (size_t i = earliestGoto; i < labelIndex; i++) {
+			if (targetBlock[i]->type == AST_STATEMENT_DECLARATION) declarations.push_back(targetBlock[i]);
+		}
+		if (declarations.empty()) continue;
+
+		for (auto it = targetBlock.begin() + earliestGoto; it != targetBlock.begin() + labelIndex; ) {
+			if ((*it)->type == AST_STATEMENT_DECLARATION) it = targetBlock.erase(it);
+			else ++it;
+		}
+		targetBlock.insert(targetBlock.begin() + earliestGoto, declarations.begin(), declarations.end());
 	}
 }
 
