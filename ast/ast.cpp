@@ -3143,6 +3143,7 @@ void Ast::clean_up(Function& function) {
 	clean_up_block(function, function.block, variableCounter, iteratorCounter, nullptr);
 	optimize_conditional_assignments(function);
 	cleanup_unused_declarations(function, function.block);
+	fix_out_of_scope_declarations(function);
 
 	for (uint32_t i = 0, labelCounter = 0; i < function.labels.size(); i++) {
 		if (!function.labels[i].jumpIds.size()) continue;
@@ -3850,6 +3851,129 @@ void Ast::cleanup_unused_declarations(Function& function, std::vector<Statement*
 			}
 		}
 		++it;
+	}
+}
+
+void Ast::fix_out_of_scope_declarations(Function& function) {
+	std::unordered_map<Statement*, Statement*> parent;
+	std::vector<std::pair<std::vector<Statement*>*, Statement*>> stack;
+	stack.push_back({ &function.block, nullptr });
+
+	while (!stack.empty()) {
+		const auto [block, owner] = stack.back();
+		stack.pop_back();
+		for (Statement* statement : *block) {
+			if (!statement) continue;
+			parent[statement] = owner;
+			if (!statement->block.empty()) stack.push_back({ &statement->block, statement });
+		}
+	}
+
+	std::vector<Statement*> declarations;
+	for (const auto& [statement, owner] : parent) {
+		if (!statement || statement->type != AST_STATEMENT_DECLARATION) continue;
+		if (statement->assignment.variables.size() != 1
+			|| statement->assignment.variables.back().type != AST_VARIABLE_SLOT)
+			continue;
+		declarations.push_back(statement);
+	}
+
+	const auto isDescendant = [&](Statement* ancestor, Statement* target) -> bool {
+		for (Statement* current = target; current; current = parent[current]) {
+			if (current == ancestor) return true;
+		}
+		return false;
+	};
+
+	for (Statement* declaration : declarations) {
+		Statement* innerOwner = parent[declaration];
+		if (!innerOwner) continue;
+
+		const uint8_t slot = declaration->assignment.variables.back().slot;
+		SlotScope* slotScope = *declaration->assignment.variables.back().slotScope;
+		bool usedOutside = false;
+
+		const auto scanExpression = [&](auto&& self, Expression*& expression, Statement* statement) -> void {
+			if (!expression || usedOutside) return;
+			switch (expression->type) {
+			case AST_EXPRESSION_VARIABLE:
+				if (expression->variable->type == AST_VARIABLE_SLOT
+					&& expression->variable->slot == slot
+					&& expression->variable->slotScope
+					&& *expression->variable->slotScope == slotScope
+					&& !isDescendant(innerOwner, statement)) {
+					usedOutside = true;
+					return;
+				}
+				if (expression->variable->table) self(self, expression->variable->table, statement);
+				if (expression->variable->tableIndex) self(self, expression->variable->tableIndex, statement);
+				break;
+			case AST_EXPRESSION_FUNCTION_CALL:
+				self(self, expression->functionCall->function, statement);
+				for (Expression*& argument : expression->functionCall->arguments) self(self, argument, statement);
+				if (expression->functionCall->multresArgument) self(self, expression->functionCall->multresArgument, statement);
+				break;
+			case AST_EXPRESSION_TABLE:
+				for (auto& field : expression->table->fields) {
+					self(self, field.key, statement);
+					self(self, field.value, statement);
+				}
+				if (expression->table->multresField) self(self, expression->table->multresField, statement);
+				break;
+			case AST_EXPRESSION_BINARY_OPERATION:
+				self(self, expression->binaryOperation->leftOperand, statement);
+				self(self, expression->binaryOperation->rightOperand, statement);
+				break;
+			case AST_EXPRESSION_UNARY_OPERATION:
+				self(self, expression->unaryOperation->operand, statement);
+				break;
+			default:
+				break;
+			}
+		};
+
+		const auto scanStatement = [&](auto&& self, Statement* statement) -> void {
+			if (!statement || usedOutside) return;
+			for (auto& variable : statement->assignment.variables) {
+				if (variable.table) scanExpression(scanExpression, variable.table, statement);
+				if (variable.tableIndex) scanExpression(scanExpression, variable.tableIndex, statement);
+			}
+			for (Expression*& expression : statement->assignment.expressions) {
+				scanExpression(scanExpression, expression, statement);
+			}
+			if (statement->assignment.multresReturn) scanExpression(scanExpression, statement->assignment.multresReturn, statement);
+			for (Statement* child : statement->block) self(self, child);
+		};
+
+		for (Statement* statement : function.block) scanStatement(scanStatement, statement);
+		if (!usedOutside) continue;
+
+		Statement* outerOwner = parent[innerOwner];
+		std::vector<Statement*>& outerBlock = outerOwner ? outerOwner->block : function.block;
+		size_t insertIndex = outerBlock.size();
+		for (size_t i = 0; i < outerBlock.size(); i++) {
+			if (outerBlock[i] == innerOwner) {
+				insertIndex = i;
+				break;
+			}
+		}
+		if (insertIndex == outerBlock.size()) continue;
+
+		Statement* outerDeclaration = new_statement(AST_STATEMENT_DECLARATION);
+		outerDeclaration->assignment.variables.push_back(declaration->assignment.variables.back());
+		outerBlock.insert(outerBlock.begin() + insertIndex, outerDeclaration);
+
+		if (declaration->assignment.expressions.size() == 1) {
+			declaration->type = AST_STATEMENT_ASSIGNMENT;
+		} else {
+			std::vector<Statement*>& innerBlock = innerOwner->block;
+			for (auto it = innerBlock.begin(); it != innerBlock.end(); ++it) {
+				if (*it == declaration) {
+					innerBlock.erase(it);
+					break;
+				}
+			}
+		}
 	}
 }
 

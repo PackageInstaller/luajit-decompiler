@@ -65,6 +65,7 @@ private:
 	void fixup_labels(Function& function);
 	void optimize_conditional_assignments(Function& function);
 	void optimize_conditional_assignments(Function& function, std::vector<Statement*>& block);
+	void fix_out_of_scope_declarations(Function& function);
 	Expression* new_slot(const uint8_t& slot);
 	Expression* new_literal(const uint8_t& literal);
 	Expression* new_signed_literal(const uint16_t& signedLiteral);
