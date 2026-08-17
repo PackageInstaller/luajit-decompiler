@@ -1682,11 +1682,17 @@ void Ast::eliminate_slots(Function& function, std::vector<Statement*>& block, Bl
 				&& block[i - 1]->assignment.variables.size() == 1
 				&& block[i - 1]->assignment.variables.back().type == AST_VARIABLE_SLOT
 				&& (*block[i - 1]->assignment.variables.back().slotScope)->usages >= 1;) {
+				auto label_safe = [&](const Statement* statement) -> bool {
+						if (!function.is_valid_label(statement->instruction.label)) return true;
+						// 跳转目标必须严格早于链起点(block[i-2]):
+						// 跳入路径会先执行 GGET/MOV 槽赋值, 内联安全; 若跳转目标落在链中间则跳过赋值, 不安全。
+						return function.labels[statement->instruction.label].target < block[i - 2]->instruction.id;
+					};
 				if (j == 1
 					&& block[i]->assignment.isPotentialMethod
 					&& i >= 2
-					&& !function.is_valid_label(block[i - 1]->instruction.label)
-					&& !function.is_valid_label(block[i - 2]->instruction.label)
+					&& label_safe(block[i - 1])
+					&& label_safe(block[i - 2])
 					&& block[i - 1]->assignment.variables.back().slot == (*block[i]->assignment.openSlots.front())->variable->slot
 					&& block[i - 1]->assignment.expressions.back()->type == AST_EXPRESSION_VARIABLE
 					&& block[i - 1]->assignment.expressions.back()->variable->type == AST_VARIABLE_TABLE_INDEX
