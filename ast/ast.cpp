@@ -1740,6 +1740,53 @@ void Ast::eliminate_slots(Function& function, std::vector<Statement*>& block, Bl
 					block.erase(block.begin() + i - 1);
 				}
 
+				// 布局 B: 参数赋值夹在 TGETS 与 CALL 之间(如 f():m(1,2) 编译为
+				// TGETS fn; KSHORT/KSTR 参数; CALL)。参数槽消除后 i-1=MOV(self 副本),
+				// i-2=TGETS(方法槽), 与布局 A(i-1=TGETS, i-2=MOV) 顺序相反。
+				if (j == 1
+					&& block[i]->assignment.isPotentialMethod
+					&& i >= 2
+					&& label_safe(block[i - 1])
+					&& label_safe(block[i - 2])
+					&& block[i - 1]->assignment.variables.size() == 1
+					&& block[i - 1]->assignment.variables.back().type == AST_VARIABLE_SLOT
+					&& (*block[i - 1]->assignment.variables.back().slotScope)->usages == 1
+					&& block[i - 1]->assignment.variables.back().slot == (*block[i]->assignment.openSlots[j])->variable->slot
+					&& block[i - 1]->assignment.expressions.size() == 1
+					&& block[i - 1]->assignment.expressions.back()->type == AST_EXPRESSION_VARIABLE
+					&& block[i - 1]->assignment.expressions.back()->variable->type == AST_VARIABLE_SLOT
+					&& block[i - 2]->assignment.variables.size() == 1
+					&& block[i - 2]->assignment.variables.back().type == AST_VARIABLE_SLOT
+					&& block[i - 2]->assignment.variables.back().slot == (*block[i]->assignment.openSlots.front())->variable->slot
+					&& block[i - 2]->assignment.expressions.size() == 1
+					&& block[i - 2]->assignment.expressions.back()->type == AST_EXPRESSION_VARIABLE
+					&& block[i - 2]->assignment.expressions.back()->variable->type == AST_VARIABLE_TABLE_INDEX
+					&& block[i - 2]->assignment.expressions.back()->variable->table->type == AST_EXPRESSION_VARIABLE
+					&& block[i - 2]->assignment.expressions.back()->variable->table->variable->type == AST_VARIABLE_SLOT
+					&& block[i - 2]->assignment.expressions.back()->variable->table->variable->slot == block[i - 1]->assignment.expressions.back()->variable->slot
+					&& block[i - 2]->assignment.expressions.back()->variable->tableIndex->type == AST_EXPRESSION_CONSTANT
+					&& block[i - 2]->assignment.expressions.back()->variable->tableIndex->constant->isName) {
+					block[i - 2]->assignment.expressions.back()->variable->table = block[i - 1]->assignment.expressions.back();
+					if (block[i]->type == AST_STATEMENT_RETURN) {
+						block[i]->assignment.multresReturn->functionCall->isMethod = true;
+						block[i]->assignment.multresReturn->functionCall->arguments.erase(block[i]->assignment.multresReturn->functionCall->arguments.begin());
+					} else {
+						block[i]->assignment.expressions.back()->functionCall->isMethod = true;
+						block[i]->assignment.expressions.back()->functionCall->arguments.erase(block[i]->assignment.expressions.back()->functionCall->arguments.begin());
+					}
+
+					block[i]->assignment.openSlots.erase(block[i]->assignment.openSlots.begin() + j);
+					block[i]->assignment.openSlots.emplace(block[i]->assignment.openSlots.begin(), &block[i - 2]->assignment.expressions.back()->variable->table);
+					function.slotScopeCollector.remove_scope(block[i - 1]->assignment.variables.back().slot, block[i - 1]->assignment.variables.back().slotScope);
+					block[i - 2]->instruction.label = block[i - 1]->instruction.label;
+					if (block[i - 1]->assignment.expressions.back()->type == AST_EXPRESSION_VARIABLE
+						&& block[i - 1]->assignment.expressions.back()->variable->type == AST_VARIABLE_SLOT) {
+						(*block[i - 1]->assignment.expressions.back()->variable->slotScope)->usages--;
+					}
+					i--;
+					block.erase(block.begin() + i);
+				}
+
 				if (block[i - 1]->assignment.variables.back().slot != (*block[i]->assignment.openSlots[j])->variable->slot) continue;
 				assert(block[i - 1]->assignment.variables.back().isMultres == (*block[i]->assignment.openSlots[j])->variable->isMultres,
 					"Multres type mismatch when trying to eliminate slot", bytecode.filePath, DEBUG_INFO);
@@ -1753,7 +1800,12 @@ void Ast::eliminate_slots(Function& function, std::vector<Statement*>& block, Bl
 					break;
 				}
 
+				function.slotScopeCollector.remove_scope(block[i - 1]->assignment.variables.back().slot, block[i - 1]->assignment.variables.back().slotScope);
+				block[i]->instruction.label = block[i - 1]->instruction.label;
+				i--;
+				block.erase(block.begin() + i);
 			}
+		}
 
 		if (block[i]->assignment.openSlots.size()
 			&& (*block[i]->assignment.openSlots.back())->type == AST_EXPRESSION_VARIABLE
