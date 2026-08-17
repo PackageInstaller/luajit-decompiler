@@ -62,6 +62,7 @@ void Ast::build_functions(Function& function, uint32_t& functionCounter) {
 		if (!(*openScope)->name.size()) {
 			(*openScope)->name = "var_" + std::to_string(function.level)
 				+ "_" + std::to_string(10000 + i);
+			(*openScope)->isSynthetic = true;
 		}
 		function.slotScopeCollector.close_scope(i, openScope, 0);
 	}
@@ -802,9 +803,6 @@ void Ast::build_expressions(Function& function, std::vector<Statement*>& block) 
 				block[i]->assignment.register_slots(block[i]->assignment.expressions.back()->functionCall->function);
 				block[i]->assignment.expressions.back()->functionCall->arguments.resize(block[i]->instruction.c + (block[i]->instruction.type == Bytecode::BC_OP_CALLM ? 0 : -1), nullptr);
 				if (block[i]->assignment.expressions.back()->functionCall->arguments.size()) block[i]->assignment.isPotentialMethod = true;
-					block[i]->instruction.a, block[i]->instruction.b, block[i]->instruction.c,
-					block[i]->assignment.expressions.back()->functionCall->arguments.size(),
-					block[i]->assignment.isPotentialMethod);
 
 				for (uint8_t j = 0; j < block[i]->assignment.expressions.back()->functionCall->arguments.size(); j++) {
 					block[i]->assignment.expressions.back()->functionCall->arguments[j] = new_slot(block[i]->instruction.a + (isFR2Enabled ? 2 : 1) + j);
@@ -1624,7 +1622,7 @@ void Ast::eliminate_slots(Function& function, std::vector<Statement*>& block, Bl
 					&& get_constant_type(block[i - 1]->assignment.expressions.back()) == NUMBER_CONSTANT
 					&& (block[i - 2]->type == AST_STATEMENT_ASSIGNMENT
 						|| (block[i - 2]->type == AST_STATEMENT_DECLARATION
-							&& (*block[i - 2]->assignment.variables.back().slotScope)->name.empty()))
+							&& (*block[i - 2]->assignment.variables.back().slotScope)->isSynthetic))
 					&& block[i - 2]->assignment.variables.size() == 1
 					&& block[i - 2]->assignment.variables.back().type == AST_VARIABLE_SLOT
 					&& (*block[i - 2]->assignment.variables.back().slotScope)->usages == 1
@@ -1691,7 +1689,7 @@ void Ast::eliminate_slots(Function& function, std::vector<Statement*>& block, Bl
 				&& !function.is_valid_label(block[i]->instruction.label)
 				&& (block[i - 1]->type == AST_STATEMENT_ASSIGNMENT
 					|| (block[i - 1]->type == AST_STATEMENT_DECLARATION
-						&& (*block[i - 1]->assignment.variables.back().slotScope)->name.empty()))
+						&& (*block[i - 1]->assignment.variables.back().slotScope)->isSynthetic))
 				&& block[i - 1]->assignment.variables.size() == 1
 				&& block[i - 1]->assignment.variables.back().type == AST_VARIABLE_SLOT
 				&& (*block[i - 1]->assignment.variables.back().slotScope)->usages >= 1;) {
@@ -1755,12 +1753,7 @@ void Ast::eliminate_slots(Function& function, std::vector<Statement*>& block, Bl
 					break;
 				}
 
-				function.slotScopeCollector.remove_scope(block[i - 1]->assignment.variables.back().slot, block[i - 1]->assignment.variables.back().slotScope);
-				block[i]->instruction.label = block[i - 1]->instruction.label;
-				i--;
-				block.erase(block.begin() + i);
 			}
-		}
 
 		if (block[i]->assignment.openSlots.size()
 			&& (*block[i]->assignment.openSlots.back())->type == AST_EXPRESSION_VARIABLE

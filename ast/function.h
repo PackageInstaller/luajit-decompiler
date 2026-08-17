@@ -10,6 +10,7 @@ struct SlotScope {
 	SlotScope* slotScope = this;
 	std::vector<SlotScope**> mergedScopes;
 	std::string name;
+	bool isSynthetic = false;  // 编译器临时槽的合成名 (var_<level>_<...>), 非 varinfo 真名
 	uint32_t scopeBegin = INVALID_ID;
 	uint32_t scopeEnd = INVALID_ID;
 	uint32_t usages = 0;
