@@ -1,4 +1,5 @@
 #include "../main.h"
+#include <unordered_set>
 
 Ast::Ast(const Bytecode& bytecode, const bool& ignoreDebugInfo, const bool& minimizeDiffs) : bytecode(bytecode), ignoreDebugInfo(ignoreDebugInfo), minimizeDiffs(minimizeDiffs) {}
 
@@ -1483,49 +1484,53 @@ void Ast::build_slot_scopes(Function& function, std::vector<Statement*>& block, 
 	}
 }
 
-void Ast::eliminate_slots(Function& function, std::vector<Statement*>& block, BlockInfo* const& previousBlock) {
-	static bool (* const has_self_reference)(const uint8_t&, Expression* const&) = [](const uint8_t& targetSlot, Expression* const& expression)->bool {
-		switch (expression->type) {
-		case AST_EXPRESSION_FUNCTION:
-			for (uint8_t i = expression->function->upvalues.size(); i--;) {
-				if (expression->function->upvalues[i].local && expression->function->upvalues[i].slot == targetSlot) return true;
-			}
+bool Ast::has_self_reference(const uint8_t& targetSlot, Expression* const& expression) {
+	if (!expression) return false;
 
-			break;
-		case AST_EXPRESSION_VARIABLE:
-			switch (expression->variable->type) {
-			case AST_VARIABLE_SLOT:
-				return expression->variable->slot == targetSlot;
-			case AST_VARIABLE_TABLE_INDEX:
-				return has_self_reference(targetSlot, expression->variable->table) || has_self_reference(targetSlot, expression->variable->tableIndex);
-			}
-
-			break;
-		case AST_EXPRESSION_FUNCTION_CALL:
-			if (has_self_reference(targetSlot, expression->functionCall->function)) return true;
-
-			for (uint32_t i = expression->functionCall->arguments.size(); i--;) {
-				if (has_self_reference(targetSlot, expression->functionCall->arguments[i])) return true;
-			}
-
-			if (expression->functionCall->multresArgument) return has_self_reference(targetSlot, expression->functionCall->multresArgument);
-			break;
-		case AST_EXPRESSION_TABLE:
-			for (uint32_t i = expression->table->fields.size(); i--;) {
-				if (has_self_reference(targetSlot, expression->table->fields[i].key) || has_self_reference(targetSlot, expression->table->fields[i].value)) return true;
-			}
-
-			if (expression->table->multresField) return has_self_reference(targetSlot, expression->table->multresField);
-			break;
-		case AST_EXPRESSION_BINARY_OPERATION:
-			return has_self_reference(targetSlot, expression->binaryOperation->leftOperand) || has_self_reference(targetSlot, expression->binaryOperation->rightOperand);
-		case AST_EXPRESSION_UNARY_OPERATION:
-			return has_self_reference(targetSlot, expression->unaryOperation->operand);
+	switch (expression->type) {
+	case AST_EXPRESSION_FUNCTION:
+		for (uint8_t i = expression->function->upvalues.size(); i--;) {
+			if (expression->function->upvalues[i].local && expression->function->upvalues[i].slot == targetSlot) return true;
 		}
 
-		return false;
-	};
+		break;
+	case AST_EXPRESSION_VARIABLE:
+		switch (expression->variable->type) {
+		case AST_VARIABLE_SLOT:
+			return expression->variable->slot == targetSlot;
+		case AST_VARIABLE_TABLE_INDEX:
+			return has_self_reference(targetSlot, expression->variable->table) || has_self_reference(targetSlot, expression->variable->tableIndex);
+		}
 
+		break;
+	case AST_EXPRESSION_FUNCTION_CALL:
+		if (has_self_reference(targetSlot, expression->functionCall->function)) return true;
+
+		for (uint32_t i = expression->functionCall->arguments.size(); i--;) {
+			if (has_self_reference(targetSlot, expression->functionCall->arguments[i])) return true;
+		}
+
+		if (expression->functionCall->multresArgument) return has_self_reference(targetSlot, expression->functionCall->multresArgument);
+		break;
+	case AST_EXPRESSION_TABLE:
+		for (uint32_t i = expression->table->fields.size(); i--;) {
+			if (has_self_reference(targetSlot, expression->table->fields[i].key) || has_self_reference(targetSlot, expression->table->fields[i].value)) return true;
+		}
+
+		if (expression->table->multresField) return has_self_reference(targetSlot, expression->table->multresField);
+		break;
+	case AST_EXPRESSION_BINARY_OPERATION:
+		return has_self_reference(targetSlot, expression->binaryOperation->leftOperand) || has_self_reference(targetSlot, expression->binaryOperation->rightOperand);
+	case AST_EXPRESSION_UNARY_OPERATION:
+		return has_self_reference(targetSlot, expression->unaryOperation->operand);
+	default:
+		break;
+	}
+
+	return false;
+}
+
+void Ast::eliminate_slots(Function& function, std::vector<Statement*>& block, BlockInfo* const& previousBlock) {
 	BlockInfo blockInfo = { .block = block, .previousBlock = previousBlock };
 	Expression* expression;
 	uint32_t index, targetIndex, targetLabel, extendedTargetLabel;
@@ -3042,9 +3047,11 @@ void Ast::clean_up(Function& function) {
 		}
 	}
 
+	optimize_conditional_assignments(function);
 	uint32_t variableCounter = 0, iteratorCounter = 0;
 	clean_up_block(function, function.block, variableCounter, iteratorCounter, nullptr);
 	optimize_conditional_assignments(function);
+	cleanup_unused_declarations(function, function.block);
 
 	for (uint32_t i = 0, labelCounter = 0; i < function.labels.size(); i++) {
 		if (!function.labels[i].jumpIds.size()) continue;
@@ -3270,6 +3277,205 @@ bool Ast::expression_matches_variable(const Expression& expression, const Variab
 	return false;
 }
 
+bool Ast::variables_equal(const Variable& a, const Variable& b) {
+	if (a.type != b.type) return false;
+
+	switch (a.type) {
+	case AST_VARIABLE_SLOT:
+		return a.slot == b.slot;
+	case AST_VARIABLE_UPVALUE:
+		return a.slotScope == b.slotScope;
+	case AST_VARIABLE_GLOBAL:
+		return a.name == b.name;
+	case AST_VARIABLE_TABLE_INDEX:
+		return expressions_equal(*a.table, *b.table)
+			&& expressions_equal(*a.tableIndex, *b.tableIndex);
+	}
+
+	return false;
+}
+
+bool Ast::is_boolean_expression(const Expression& expr) {
+	switch (expr.type) {
+	case AST_EXPRESSION_CONSTANT:
+		return expr.constant->type == AST_CONSTANT_TRUE || expr.constant->type == AST_CONSTANT_FALSE;
+	case AST_EXPRESSION_UNARY_OPERATION:
+		return expr.unaryOperation->type == AST_UNARY_NOT;
+	case AST_EXPRESSION_BINARY_OPERATION:
+		switch (expr.binaryOperation->type) {
+		case AST_BINARY_LESS_THAN:
+		case AST_BINARY_LESS_EQUAL:
+		case AST_BINARY_GREATER_THEN:
+		case AST_BINARY_GREATER_EQUAL:
+		case AST_BINARY_EQUAL:
+		case AST_BINARY_NOT_EQUAL:
+			return true;
+		case AST_BINARY_AND:
+		case AST_BINARY_OR:
+			return is_boolean_expression(*expr.binaryOperation->leftOperand)
+				&& is_boolean_expression(*expr.binaryOperation->rightOperand);
+		default:
+			return false;
+		}
+	default:
+		return false;
+	}
+}
+
+Ast::Expression* Ast::new_unary_operation(const AST_UNARY_OPERATION& type, Expression* const& operand) {
+	Expression* const expression = new_expression(AST_EXPRESSION_UNARY_OPERATION);
+	expression->unaryOperation->type = type;
+	expression->unaryOperation->operand = operand;
+	return expression;
+}
+
+Ast::Expression* Ast::new_binary_operation(const AST_BINARY_OPERATION& type, Expression* const& left, Expression* const& right) {
+	Expression* const expression = new_expression(AST_EXPRESSION_BINARY_OPERATION);
+	expression->binaryOperation->type = type;
+	expression->binaryOperation->leftOperand = left;
+	expression->binaryOperation->rightOperand = right;
+	return expression;
+}
+
+Ast::Expression* Ast::invert_expression(Expression* const& expr) {
+	if (!expr) return nullptr;
+
+	if (expr->type == AST_EXPRESSION_UNARY_OPERATION && expr->unaryOperation->type == AST_UNARY_NOT) {
+		if (is_boolean_expression(*expr->unaryOperation->operand)) {
+			return expr->unaryOperation->operand;
+		}
+	}
+
+	if (expr->type == AST_EXPRESSION_BINARY_OPERATION) {
+		AST_BINARY_OPERATION invertedType;
+		bool canInvert = true;
+		switch (expr->binaryOperation->type) {
+		case AST_BINARY_LESS_THAN:
+			invertedType = AST_BINARY_GREATER_EQUAL;
+			break;
+		case AST_BINARY_LESS_EQUAL:
+			invertedType = AST_BINARY_GREATER_THEN;
+			break;
+		case AST_BINARY_GREATER_THEN:
+			invertedType = AST_BINARY_LESS_EQUAL;
+			break;
+		case AST_BINARY_GREATER_EQUAL:
+			invertedType = AST_BINARY_LESS_THAN;
+			break;
+		case AST_BINARY_EQUAL:
+			invertedType = AST_BINARY_NOT_EQUAL;
+			break;
+		case AST_BINARY_NOT_EQUAL:
+			invertedType = AST_BINARY_EQUAL;
+			break;
+		default:
+			canInvert = false;
+			break;
+		}
+
+		if (canInvert) {
+			return new_binary_operation(invertedType, expr->binaryOperation->leftOperand, expr->binaryOperation->rightOperand);
+		}
+	}
+
+	if (expr->type == AST_EXPRESSION_CONSTANT) {
+		if (expr->constant->type == AST_CONSTANT_TRUE) return new_primitive(1); // false
+		if (expr->constant->type == AST_CONSTANT_FALSE) return new_primitive(2); // true
+	}
+
+	return new_unary_operation(AST_UNARY_NOT, expr);
+}
+
+Ast::Expression* Ast::build_boolean_test(Expression* const& expr, const bool& isTruthy) {
+	if (isTruthy) {
+		if (is_boolean_expression(*expr)) return expr;
+		return new_unary_operation(AST_UNARY_NOT, new_unary_operation(AST_UNARY_NOT, expr));
+	}
+	return invert_expression(expr);
+}
+
+Ast::Expression* Ast::simplify_expression(Expression* const& expr) {
+	if (!expr) return nullptr;
+
+	if (expr->type == AST_EXPRESSION_UNARY_OPERATION) {
+		expr->unaryOperation->operand = simplify_expression(expr->unaryOperation->operand);
+		if (expr->unaryOperation->type == AST_UNARY_NOT) {
+			Expression* inner = expr->unaryOperation->operand;
+			if (inner->type == AST_EXPRESSION_BINARY_OPERATION) {
+				switch (inner->binaryOperation->type) {
+				case AST_BINARY_LESS_THAN:
+				case AST_BINARY_LESS_EQUAL:
+				case AST_BINARY_GREATER_THEN:
+				case AST_BINARY_GREATER_EQUAL:
+				case AST_BINARY_EQUAL:
+				case AST_BINARY_NOT_EQUAL:
+					return invert_expression(inner);
+				default:
+					break;
+				}
+			}
+			if (inner->type == AST_EXPRESSION_UNARY_OPERATION && inner->unaryOperation->type == AST_UNARY_NOT) {
+				if (is_boolean_expression(*inner->unaryOperation->operand)) {
+					return inner->unaryOperation->operand;
+				}
+			}
+		}
+		return expr;
+	}
+
+	if (expr->type == AST_EXPRESSION_BINARY_OPERATION) {
+		expr->binaryOperation->leftOperand = simplify_expression(expr->binaryOperation->leftOperand);
+		expr->binaryOperation->rightOperand = simplify_expression(expr->binaryOperation->rightOperand);
+
+		// Helper to extract condition from an AND chain that terminates with a specific constant
+		auto extract_and_const_condition = [&](const auto& self, Expression* e, const AST_CONSTANT& constType)->Expression* {
+			if (!e || e->type != AST_EXPRESSION_BINARY_OPERATION || e->binaryOperation->type != AST_BINARY_AND) return nullptr;
+			if (e->binaryOperation->rightOperand->type == AST_EXPRESSION_CONSTANT
+				&& e->binaryOperation->rightOperand->constant->type == constType) {
+				return e->binaryOperation->leftOperand;
+			}
+			Expression* sub = self(self, e->binaryOperation->rightOperand, constType);
+			if (sub) {
+				return new_binary_operation(AST_BINARY_AND, e->binaryOperation->leftOperand, sub);
+			}
+			return nullptr;
+		};
+
+		// (cond and true) or false  =>  cond / not not cond
+		// (cond and false) or true  =>  invert(cond)
+		if (expr->binaryOperation->type == AST_BINARY_OR) {
+			Expression* left = expr->binaryOperation->leftOperand;
+			Expression* right = expr->binaryOperation->rightOperand;
+
+			if (right->type == AST_EXPRESSION_CONSTANT && right->constant->type == AST_CONSTANT_FALSE) {
+				Expression* cond = extract_and_const_condition(extract_and_const_condition, left, AST_CONSTANT_TRUE);
+				if (cond) return build_boolean_test(cond, true);
+			} else if (right->type == AST_EXPRESSION_CONSTANT && right->constant->type == AST_CONSTANT_TRUE) {
+				Expression* cond = extract_and_const_condition(extract_and_const_condition, left, AST_CONSTANT_FALSE);
+				if (cond) return build_boolean_test(cond, false);
+			}
+		}
+
+		if (expr->binaryOperation->type == AST_BINARY_AND) {
+			Expression* left = expr->binaryOperation->leftOperand;
+			Expression* right = expr->binaryOperation->rightOperand;
+
+			if (right->type == AST_EXPRESSION_CONSTANT && right->constant->type == AST_CONSTANT_TRUE) {
+				if (left->type == AST_EXPRESSION_BINARY_OPERATION && left->binaryOperation->type == AST_BINARY_OR) {
+					if (left->binaryOperation->rightOperand->type == AST_EXPRESSION_CONSTANT
+						&& left->binaryOperation->rightOperand->constant->type == AST_CONSTANT_FALSE) {
+						return build_boolean_test(left->binaryOperation->leftOperand, true);
+					}
+				}
+			}
+		}
+
+		return expr;
+	}
+
+	return expr;
+}
+
 void Ast::optimize_conditional_assignments(Function& function) {
 	optimize_conditional_assignments(function, function.block);
 }
@@ -3279,63 +3485,280 @@ void Ast::optimize_conditional_assignments(Function& function, std::vector<State
 		if (statement && !statement->block.empty()) optimize_conditional_assignments(function, statement->block);
 	}
 
-	for (uint32_t i = 0; i + 1 < block.size(); i++) {
-		Statement* declaration = block[i];
-		Statement* ifStatement = block[i + 1];
+	// 1. 简化所有已有赋值中的表达式 (如 (a > b) and true or false -> a > b)
+	for (Statement* statement : block) {
+		if (!statement) continue;
+		for (Expression*& expr : statement->assignment.expressions) {
+			expr = simplify_expression(expr);
+		}
+	}
 
-		if (!declaration || !ifStatement) continue;
-		if (declaration->type != AST_STATEMENT_DECLARATION
-			|| ifStatement->type != AST_STATEMENT_IF)
-			continue;
-		if (i + 2 < block.size() && block[i + 2]->type == AST_STATEMENT_ELSE) continue;
-		if (declaration->assignment.variables.size() != 1
-			|| declaration->assignment.expressions.size() != 0)
-			continue;
-
-		const uint8_t variableSlot = declaration->assignment.variables.back().slot;
-		if (ifStatement->assignment.expressions.size() != 1
-			|| ifStatement->assignment.expressions.back()->type != AST_EXPRESSION_UNARY_OPERATION
-			|| ifStatement->assignment.expressions.back()->unaryOperation->type != AST_UNARY_NOT
-			|| ifStatement->block.size() != 1)
-			continue;
-
-		Expression* conditionOperand = ifStatement->assignment.expressions.back()->unaryOperation->operand;
-		Statement* innerAssignment = ifStatement->block.front();
-		if (!innerAssignment
-			|| innerAssignment->type != AST_STATEMENT_ASSIGNMENT
-			|| innerAssignment->assignment.variables.size() != 1
-			|| innerAssignment->assignment.variables.back().type != AST_VARIABLE_SLOT
-			|| innerAssignment->assignment.variables.back().slot != variableSlot
-			|| innerAssignment->assignment.expressions.size() != 1)
-			continue;
-
-		Expression* defaultValue = innerAssignment->assignment.expressions.back();
-
-		Expression* orExpression = new_expression(AST_EXPRESSION_BINARY_OPERATION);
-		orExpression->binaryOperation->type = AST_BINARY_OR;
-		orExpression->binaryOperation->leftOperand = conditionOperand;
-		orExpression->binaryOperation->rightOperand = defaultValue;
-		declaration->assignment.expressions.clear();
-		declaration->assignment.expressions.emplace_back(orExpression);
-		block.erase(block.begin() + i + 1);
-
-		// 若变量紧随其后被直接赋值给同一目标，则进一步内联为 `target = target or default`。
+	// 2. 遍历合并条件赋值模式
+	for (uint32_t i = 0; i < block.size(); i++) {
+		// Pattern A: if-else 对同一变量赋值
 		if (i + 1 < block.size()) {
-			Statement* assignment = block[i + 1];
-			if (assignment
-				&& assignment->type == AST_STATEMENT_ASSIGNMENT
-				&& assignment->assignment.variables.size() == 1
-				&& assignment->assignment.expressions.size() == 1
-				&& assignment->assignment.expressions.back()->type == AST_EXPRESSION_VARIABLE
-				&& assignment->assignment.expressions.back()->variable->type == AST_VARIABLE_SLOT
-				&& assignment->assignment.expressions.back()->variable->slot == variableSlot
-				&& expression_matches_variable(*conditionOperand, assignment->assignment.variables.back())) {
-				assignment->assignment.expressions.back() = orExpression;
-				block.erase(block.begin() + i);
+			Statement* ifStatement = block[i];
+			Statement* elseStatement = block[i + 1];
+
+			if (ifStatement && elseStatement
+				&& ifStatement->type == AST_STATEMENT_IF
+				&& elseStatement->type == AST_STATEMENT_ELSE
+				&& ifStatement->assignment.expressions.size() == 1
+				&& ifStatement->block.size() == 1
+				&& elseStatement->block.size() == 1) {
+				Statement* trueAssign = ifStatement->block.front();
+				Statement* falseAssign = elseStatement->block.front();
+
+				if (trueAssign && falseAssign
+					&& trueAssign->type == AST_STATEMENT_ASSIGNMENT
+					&& falseAssign->type == AST_STATEMENT_ASSIGNMENT
+					&& trueAssign->assignment.variables.size() == 1
+					&& falseAssign->assignment.variables.size() == 1
+					&& trueAssign->assignment.expressions.size() == 1
+					&& falseAssign->assignment.expressions.size() == 1
+					&& variables_equal(trueAssign->assignment.variables.front(), falseAssign->assignment.variables.front())) {
+
+					Expression* cond = ifStatement->assignment.expressions.front();
+					Expression* trueVal = trueAssign->assignment.expressions.front();
+					Expression* falseVal = falseAssign->assignment.expressions.front();
+
+					bool v1IsTrue = (trueVal->type == AST_EXPRESSION_CONSTANT && trueVal->constant->type == AST_CONSTANT_TRUE);
+					bool v1IsFalse = (trueVal->type == AST_EXPRESSION_CONSTANT && trueVal->constant->type == AST_CONSTANT_FALSE);
+					bool v2IsTrue = (falseVal->type == AST_EXPRESSION_CONSTANT && falseVal->constant->type == AST_CONSTANT_TRUE);
+					bool v2IsFalse = (falseVal->type == AST_EXPRESSION_CONSTANT && falseVal->constant->type == AST_CONSTANT_FALSE);
+
+					Expression* resultExpr = nullptr;
+					if (v1IsTrue && v2IsFalse) {
+						resultExpr = build_boolean_test(cond, true);
+					} else if (v1IsFalse && v2IsTrue) {
+						resultExpr = build_boolean_test(cond, false);
+					} else if (!v1IsFalse && !(trueVal->type == AST_EXPRESSION_CONSTANT && trueVal->constant->type == AST_CONSTANT_NIL)) {
+						resultExpr = new_binary_operation(AST_BINARY_OR,
+							new_binary_operation(AST_BINARY_AND, cond, trueVal),
+							falseVal);
+					}
+
+					if (resultExpr) {
+						resultExpr = simplify_expression(resultExpr);
+
+						// 若前面紧邻该变量的空声明，直接合并为 `local x = resultExpr`
+						if (i > 0
+							&& block[i - 1]->type == AST_STATEMENT_DECLARATION
+							&& block[i - 1]->assignment.variables.size() == 1
+							&& block[i - 1]->assignment.expressions.empty()
+							&& variables_equal(block[i - 1]->assignment.variables.front(), trueAssign->assignment.variables.front())) {
+							block[i - 1]->assignment.expressions.push_back(resultExpr);
+							block.erase(block.begin() + i, block.begin() + i + 2);
+							i = i > 1 ? i - 2 : 0;
+							continue;
+						}
+
+						trueAssign->assignment.expressions.front() = resultExpr;
+						trueAssign->instruction = ifStatement->instruction;
+						block[i] = trueAssign;
+						block.erase(block.begin() + i + 1);
+						i = i ? i - 1 : 0;
+						continue;
+					}
+				}
 			}
 		}
 
-		i = i ? i - 1 : 0;
+		// Pattern B: declaration/assignment 紧接 if not a then a = default end
+		if (i + 1 < block.size()) {
+			Statement* prev = block[i];
+			Statement* ifStatement = block[i + 1];
+
+			if (prev && ifStatement
+				&& (prev->type == AST_STATEMENT_DECLARATION || prev->type == AST_STATEMENT_ASSIGNMENT)
+				&& ifStatement->type == AST_STATEMENT_IF
+				&& (i + 2 >= block.size() || block[i + 2]->type != AST_STATEMENT_ELSE)
+				&& prev->assignment.variables.size() == 1
+				&& ifStatement->assignment.expressions.size() == 1
+				&& ifStatement->assignment.expressions.back()->type == AST_EXPRESSION_UNARY_OPERATION
+				&& ifStatement->assignment.expressions.back()->unaryOperation->type == AST_UNARY_NOT
+				&& ifStatement->block.size() == 1) {
+
+				Expression* conditionOperand = ifStatement->assignment.expressions.back()->unaryOperation->operand;
+				Statement* innerAssignment = ifStatement->block.front();
+
+				if (innerAssignment
+					&& innerAssignment->type == AST_STATEMENT_ASSIGNMENT
+					&& innerAssignment->assignment.variables.size() == 1
+					&& innerAssignment->assignment.expressions.size() == 1
+					&& variables_equal(innerAssignment->assignment.variables.front(), prev->assignment.variables.front())
+					&& (prev->assignment.expressions.empty() || expression_matches_variable(*conditionOperand, prev->assignment.variables.front()))) {
+
+					Expression* defaultValue = innerAssignment->assignment.expressions.back();
+					Expression* baseValue = prev->assignment.expressions.empty()
+						? conditionOperand
+						: prev->assignment.expressions.back();
+
+					Expression* orExpression = new_binary_operation(AST_BINARY_OR, baseValue, defaultValue);
+					orExpression = simplify_expression(orExpression);
+
+					prev->assignment.expressions.clear();
+					prev->assignment.expressions.emplace_back(orExpression);
+					block.erase(block.begin() + i + 1);
+
+					// 若变量紧随其后被直接赋值给同一目标，则进一步内联为 `target = target or default`
+					if (i + 1 < block.size()) {
+						Statement* assignment = block[i + 1];
+						if (assignment
+							&& assignment->type == AST_STATEMENT_ASSIGNMENT
+							&& assignment->assignment.variables.size() == 1
+							&& assignment->assignment.expressions.size() == 1
+							&& expression_matches_variable(*assignment->assignment.expressions.back(), prev->assignment.variables.back())
+							&& expression_matches_variable(*conditionOperand, assignment->assignment.variables.back())) {
+							assignment->assignment.expressions.back() = orExpression;
+							block.erase(block.begin() + i);
+						}
+					}
+
+					i = i ? i - 1 : 0;
+					continue;
+				}
+			}
+		}
+
+		// Pattern C: 独立的 `if not a then a = default end` (作为普通变量默认赋值)
+		if (block[i]->type == AST_STATEMENT_IF
+			&& (i + 1 >= block.size() || block[i + 1]->type != AST_STATEMENT_ELSE)
+			&& block[i]->assignment.expressions.size() == 1
+			&& block[i]->assignment.expressions.back()->type == AST_EXPRESSION_UNARY_OPERATION
+			&& block[i]->assignment.expressions.back()->unaryOperation->type == AST_UNARY_NOT
+			&& block[i]->block.size() == 1) {
+
+			Expression* conditionOperand = block[i]->assignment.expressions.back()->unaryOperation->operand;
+			Statement* innerAssignment = block[i]->block.front();
+
+			if (innerAssignment
+				&& innerAssignment->type == AST_STATEMENT_ASSIGNMENT
+				&& innerAssignment->assignment.variables.size() == 1
+				&& innerAssignment->assignment.expressions.size() == 1
+				&& expression_matches_variable(*conditionOperand, innerAssignment->assignment.variables.front())) {
+
+				Expression* orExpression = new_binary_operation(AST_BINARY_OR, conditionOperand, innerAssignment->assignment.expressions.back());
+				orExpression = simplify_expression(orExpression);
+
+				innerAssignment->assignment.expressions.back() = orExpression;
+				innerAssignment->instruction = block[i]->instruction;
+				block[i] = innerAssignment;
+				i = i ? i - 1 : 0;
+				continue;
+			}
+		}
+
+		// Pattern D: 紧邻的空声明与赋值/声明合并 (local x; x = expr => local x = expr)
+		if (i + 1 < block.size()) {
+			Statement* decl = block[i];
+			Statement* nextStmt = block[i + 1];
+
+			if (decl && nextStmt
+				&& decl->type == AST_STATEMENT_DECLARATION
+				&& (nextStmt->type == AST_STATEMENT_ASSIGNMENT || nextStmt->type == AST_STATEMENT_DECLARATION)
+				&& decl->assignment.expressions.empty()
+				&& decl->assignment.variables.size() == 1
+				&& nextStmt->assignment.variables.size() == 1
+				&& nextStmt->assignment.expressions.size() == 1
+				&& variables_equal(decl->assignment.variables.front(), nextStmt->assignment.variables.front())) {
+
+				bool selfRef = false;
+				if (decl->assignment.variables.front().type == AST_VARIABLE_SLOT) {
+					selfRef = has_self_reference(decl->assignment.variables.front().slot, nextStmt->assignment.expressions.front());
+				}
+
+				if (!selfRef) {
+					if (decl->assignment.variables.front().type == AST_VARIABLE_SLOT
+						&& nextStmt->assignment.variables.front().type == AST_VARIABLE_SLOT) {
+						(*nextStmt->assignment.variables.front().slotScope)->name = (*decl->assignment.variables.front().slotScope)->name;
+					}
+					decl->assignment.expressions.push_back(nextStmt->assignment.expressions.front());
+					block.erase(block.begin() + i + 1);
+					i = i ? i - 1 : 0;
+					continue;
+				}
+			}
+		}
+	}
+}
+
+void Ast::cleanup_unused_declarations(Function& function, std::vector<Statement*>& block) {
+	for (Statement* statement : block) {
+		if (statement && !statement->block.empty()) cleanup_unused_declarations(function, statement->block);
+	}
+
+	// 收集在所有表达式和非空赋值中被引用的槽位
+	std::unordered_set<uint8_t> usedSlots;
+
+	auto collect_from_expr = [&](const auto& self, Expression* const& expr)->void {
+		if (!expr) return;
+		switch (expr->type) {
+		case AST_EXPRESSION_VARIABLE:
+			if (expr->variable->type == AST_VARIABLE_SLOT) {
+				usedSlots.insert(expr->variable->slot);
+			} else if (expr->variable->type == AST_VARIABLE_TABLE_INDEX) {
+				self(self, expr->variable->table);
+				self(self, expr->variable->tableIndex);
+			}
+			break;
+		case AST_EXPRESSION_TABLE:
+			for (const auto& f : expr->table->fields) {
+				self(self, f.key);
+				self(self, f.value);
+			}
+			break;
+		case AST_EXPRESSION_FUNCTION_CALL:
+			for (Expression* arg : expr->functionCall->arguments) self(self, arg);
+			break;
+		case AST_EXPRESSION_UNARY_OPERATION:
+			self(self, expr->unaryOperation->operand);
+			break;
+		case AST_EXPRESSION_BINARY_OPERATION:
+			self(self, expr->binaryOperation->leftOperand);
+			self(self, expr->binaryOperation->rightOperand);
+			break;
+		default:
+			break;
+		}
+	};
+
+	auto collect_from_statement = [&](const auto& self, Statement* const& stmt)->void {
+		if (!stmt) return;
+		for (Expression* expr : stmt->assignment.expressions) collect_from_expr(collect_from_expr, expr);
+		if (stmt->type != AST_STATEMENT_DECLARATION) {
+			for (const Variable& var : stmt->assignment.variables) {
+				if (var.type == AST_VARIABLE_SLOT) usedSlots.insert(var.slot);
+				else if (var.type == AST_VARIABLE_TABLE_INDEX) {
+					collect_from_expr(collect_from_expr, var.table);
+					collect_from_expr(collect_from_expr, var.tableIndex);
+				}
+			}
+		}
+		for (Statement* child : stmt->block) self(self, child);
+	};
+
+	for (Statement* s : function.block) collect_from_statement(collect_from_statement, s);
+
+	// 移除没有初始值且槽位从未被任何表达式或赋值引用的空声明
+	for (auto it = block.begin(); it != block.end();) {
+		Statement* stmt = *it;
+		if (stmt && stmt->type == AST_STATEMENT_DECLARATION
+			&& stmt->assignment.expressions.empty()
+			&& !function.hasDebugInfo) {
+			bool allUnused = true;
+			for (const Variable& var : stmt->assignment.variables) {
+				if (var.type == AST_VARIABLE_SLOT && usedSlots.contains(var.slot)) {
+					allUnused = false;
+					break;
+				}
+			}
+			if (allUnused) {
+				it = block.erase(it);
+				continue;
+			}
+		}
+		++it;
 	}
 }
 

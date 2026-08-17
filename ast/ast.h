@@ -81,6 +81,15 @@ private:
 	static void check_valid_name(Constant* const& constant);
 	static bool expressions_equal(const Expression& a, const Expression& b);
 	static bool expression_matches_variable(const Expression& expression, const Variable& variable);
+	static bool variables_equal(const Variable& a, const Variable& b);
+	static bool is_boolean_expression(const Expression& expr);
+	Expression* new_unary_operation(const AST_UNARY_OPERATION& type, Expression* const& operand);
+	Expression* new_binary_operation(const AST_BINARY_OPERATION& type, Expression* const& left, Expression* const& right);
+	Expression* invert_expression(Expression* const& expr);
+	Expression* build_boolean_test(Expression* const& expr, const bool& isTruthy = true);
+	Expression* simplify_expression(Expression* const& expr);
+	static bool has_self_reference(const uint8_t& targetSlot, Expression* const& expression);
+	void cleanup_unused_declarations(Function& function, std::vector<Statement*>& block);
 	void check_special_number(Expression* const& expression, const bool& isCdata = false);
 	static CONSTANT_TYPE get_constant_type(Expression* const& expression);
 
