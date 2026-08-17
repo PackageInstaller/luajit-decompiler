@@ -802,6 +802,9 @@ void Ast::build_expressions(Function& function, std::vector<Statement*>& block) 
 				block[i]->assignment.register_slots(block[i]->assignment.expressions.back()->functionCall->function);
 				block[i]->assignment.expressions.back()->functionCall->arguments.resize(block[i]->instruction.c + (block[i]->instruction.type == Bytecode::BC_OP_CALLM ? 0 : -1), nullptr);
 				if (block[i]->assignment.expressions.back()->functionCall->arguments.size()) block[i]->assignment.isPotentialMethod = true;
+					block[i]->instruction.a, block[i]->instruction.b, block[i]->instruction.c,
+					block[i]->assignment.expressions.back()->functionCall->arguments.size(),
+					block[i]->assignment.isPotentialMethod);
 
 				for (uint8_t j = 0; j < block[i]->assignment.expressions.back()->functionCall->arguments.size(); j++) {
 					block[i]->assignment.expressions.back()->functionCall->arguments[j] = new_slot(block[i]->instruction.a + (isFR2Enabled ? 2 : 1) + j);
@@ -1600,6 +1603,11 @@ void Ast::eliminate_slots(Function& function, std::vector<Statement*>& block, Bl
 
 			break;
 		case AST_STATEMENT_ASSIGNMENT:
+		case AST_STATEMENT_FUNCTION_CALL:
+			if (block[i]->type == AST_STATEMENT_FUNCTION_CALL) {
+				// FUNCTION_CALL(无返回值调用) 语句: 无赋值目标, 直接进入 openSlots 消除。
+				goto eliminate_function_call_open_slots;
+			}
 			switch (block[i]->assignment.variables.back().type) {
 			case AST_VARIABLE_SLOT:
 				if (block[i]->assignment.expressions.back()->type == AST_EXPRESSION_BINARY_OPERATION
@@ -1614,7 +1622,9 @@ void Ast::eliminate_slots(Function& function, std::vector<Statement*>& block, Bl
 					&& (*block[i - 1]->assignment.variables.back().slotScope)->usages == 1
 					&& block[i - 1]->assignment.variables.back().slot == block[i]->assignment.expressions.back()->binaryOperation->leftOperand->variable->slot
 					&& get_constant_type(block[i - 1]->assignment.expressions.back()) == NUMBER_CONSTANT
-					&& block[i - 2]->type == AST_STATEMENT_ASSIGNMENT
+					&& (block[i - 2]->type == AST_STATEMENT_ASSIGNMENT
+						|| (block[i - 2]->type == AST_STATEMENT_DECLARATION
+							&& (*block[i - 2]->assignment.variables.back().slotScope)->name.empty()))
 					&& block[i - 2]->assignment.variables.size() == 1
 					&& block[i - 2]->assignment.variables.back().type == AST_VARIABLE_SLOT
 					&& (*block[i - 2]->assignment.variables.back().slotScope)->usages == 1
@@ -1657,6 +1667,7 @@ void Ast::eliminate_slots(Function& function, std::vector<Statement*>& block, Bl
 			break;
 		}
 
+	eliminate_function_call_open_slots:
 		if (block[i]->type == AST_STATEMENT_DECLARATION
 			&& block[i]->assignment.openSlots.size() == 1
 			&& (*(*block[i]->assignment.openSlots.back())->variable->slotScope)->usages > 1
@@ -1678,7 +1689,9 @@ void Ast::eliminate_slots(Function& function, std::vector<Statement*>& block, Bl
 				j--
 				&& i
 				&& !function.is_valid_label(block[i]->instruction.label)
-				&& block[i - 1]->type == AST_STATEMENT_ASSIGNMENT
+				&& (block[i - 1]->type == AST_STATEMENT_ASSIGNMENT
+					|| (block[i - 1]->type == AST_STATEMENT_DECLARATION
+						&& (*block[i - 1]->assignment.variables.back().slotScope)->name.empty()))
 				&& block[i - 1]->assignment.variables.size() == 1
 				&& block[i - 1]->assignment.variables.back().type == AST_VARIABLE_SLOT
 				&& (*block[i - 1]->assignment.variables.back().slotScope)->usages >= 1;) {
