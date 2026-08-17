@@ -1784,13 +1784,18 @@ void Ast::eliminate_slots(Function& function, std::vector<Statement*>& block, Bl
 									break;
 							} else if (index
 									&& block[index]->assignment.expressions.size() == 1
-									&& !function.is_valid_label(block[index]->instruction.label)
-									&& block[index - 1]->type == AST_STATEMENT_ASSIGNMENT
+									&& !function.is_valid_label(block[index]->instruction.label)) {
+								if (block[index]->instruction.type == Bytecode::BC_OP_IST
+									|| block[index]->instruction.type == Bytecode::BC_OP_ISF) {
+									break;
+								}
+								if (block[index - 1]->type == AST_STATEMENT_ASSIGNMENT
 									&& block[index - 1]->assignment.variables.size() == 1
 									&& block[index - 1]->assignment.variables.back().type == AST_VARIABLE_SLOT
 									&& (*block[index - 1]->assignment.variables.back().slotScope)->scopeBegin == block[index - 1]->instruction.id
 									&& *block[index - 1]->assignment.variables.back().slotScope == *block[i]->assignment.variables.back().slotScope) {
-								break;
+									break;
+								}
 							}
 
 							index = INVALID_ID;
@@ -1800,9 +1805,7 @@ void Ast::eliminate_slots(Function& function, std::vector<Statement*>& block, Bl
 								|| block[index]->assignment.variables.back().type != AST_VARIABLE_SLOT
 								|| (*block[index]->assignment.variables.back().slotScope)->scopeBegin != block[index]->instruction.id
 								|| *block[index]->assignment.variables.back().slotScope != *block[i]->assignment.variables.back().slotScope
-								|| (index != i - 4
-									&& (block[index]->assignment.expressions.back()->type != AST_EXPRESSION_CONSTANT
-										|| !get_constant_type(block[index]->assignment.expressions.back()))))
+								|| block[index]->assignment.expressions.size() != 1)
 								index = INVALID_ID;
 							break;
 						}
@@ -1939,8 +1942,11 @@ void Ast::eliminate_slots(Function& function, std::vector<Statement*>& block, Bl
 									if (block[j]->instruction.target <= block[j]->instruction.id
 										|| block[j]->instruction.target > function.labels[targetLabel].target
 										|| (block[j]->instruction.target == function.labels[targetLabel].target
-											? !block[j]->assignment.variables.size()
-												|| *block[j]->assignment.variables.back().slotScope != *block[i]->assignment.variables.back().slotScope
+											? (!block[j]->assignment.variables.size()
+												&& block[j]->instruction.type != Bytecode::BC_OP_IST
+												&& block[j]->instruction.type != Bytecode::BC_OP_ISF)
+												|| (block[j]->assignment.variables.size()
+													&& *block[j]->assignment.variables.back().slotScope != *block[i]->assignment.variables.back().slotScope)
 												|| has_self_reference(block[i]->assignment.variables.back().slot, block[j]->assignment.expressions.back())
 											: block[j]->assignment.variables.size()))
 										break;
@@ -1974,22 +1980,17 @@ void Ast::eliminate_slots(Function& function, std::vector<Statement*>& block, Bl
 										if (function.is_valid_label(block[j]->instruction.label)
 											|| block[j]->instruction.type != Bytecode::BC_OP_JMP
 											|| block[j]->instruction.target != function.labels[targetLabel].target
-											|| block[j - 1]->assignment.expressions.back()->type != AST_EXPRESSION_CONSTANT
-											|| !get_constant_type(block[j - 1]->assignment.expressions.back()))
+											|| block[j - 1]->assignment.expressions.size() != 1)
 											break;
 
-										switch (block[j - 1]->assignment.expressions.back()->constant->type) {
-										case AST_CONSTANT_NIL:
-										case AST_CONSTANT_FALSE:
+										if (block[j - 1]->assignment.expressions.back()->type == AST_EXPRESSION_CONSTANT
+											&& (block[j - 1]->assignment.expressions.back()->constant->type == AST_CONSTANT_NIL
+												|| block[j - 1]->assignment.expressions.back()->constant->type == AST_CONSTANT_FALSE)) {
 											conditionBuilder.add_node(ConditionBuilder::Node::FALSY_TEST, block[j - 1]->instruction.label,
 												function.get_label_from_id(block[j]->instruction.target), &block[j - 1]->assignment.expressions);
-											break;
-										case AST_CONSTANT_TRUE:
-										case AST_CONSTANT_STRING:
-										case AST_CONSTANT_NUMBER:
+										} else {
 											conditionBuilder.add_node(ConditionBuilder::Node::TRUTHY_TEST, block[j - 1]->instruction.label,
 												function.get_label_from_id(block[j]->instruction.target), &block[j - 1]->assignment.expressions);
-											break;
 										}
 
 										continue;
@@ -2152,8 +2153,7 @@ void Ast::eliminate_conditions(Function& function, std::vector<Statement*>& bloc
 						&& block[index + 1]->instruction.type == Bytecode::BC_OP_JMP
 						&& block[index]->assignment.variables.size() == 1
 						&& block[index]->assignment.variables.back().type == AST_VARIABLE_SLOT
-						&& block[index]->assignment.expressions.back()->type == AST_EXPRESSION_CONSTANT
-						&& get_constant_type(block[index]->assignment.expressions.back()))
+						&& block[index]->assignment.expressions.size() == 1)
 						break;
 				default:
 					index = INVALID_ID;
@@ -2174,8 +2174,7 @@ void Ast::eliminate_conditions(Function& function, std::vector<Statement*>& bloc
 				|| block[i - 1]->type != AST_STATEMENT_ASSIGNMENT
 				|| block[i - 1]->assignment.variables.size() != 1
 				|| block[i - 1]->assignment.variables.back().type != AST_VARIABLE_SLOT
-				|| block[i - 1]->assignment.expressions.back()->type != AST_EXPRESSION_CONSTANT
-				|| !get_constant_type(block[i - 1]->assignment.expressions.back()))
+				|| block[i - 1]->assignment.expressions.size() != 1)
 				continue;
 			assignmentIndex = i - 1;
 			break;
@@ -2338,8 +2337,7 @@ void Ast::eliminate_conditions(Function& function, std::vector<Statement*>& bloc
 					if (block[k]->assignment.variables.size() == 1
 						&& block[k]->assignment.variables.back().type == AST_VARIABLE_SLOT
 						&& block[k]->assignment.variables.back().slot == block[assignmentIndex]->assignment.variables.back().slot
-						&& block[k]->assignment.expressions.back()->type == AST_EXPRESSION_CONSTANT
-						&& get_constant_type(block[k]->assignment.expressions.back())
+						&& block[k]->assignment.expressions.size() == 1
 						&& ++k != targetIndex
 						&& (block[k]->type == AST_STATEMENT_GOTO
 							|| block[k]->type == AST_STATEMENT_BREAK)
@@ -2387,18 +2385,14 @@ void Ast::eliminate_conditions(Function& function, std::vector<Statement*>& bloc
 					&& targetLabel == extendedTargetLabel);
 				continue;
 			case AST_STATEMENT_ASSIGNMENT:
-				switch (block[j]->assignment.expressions.back()->constant->type) {
-				case AST_CONSTANT_NIL:
-				case AST_CONSTANT_FALSE:
+				if (block[j]->assignment.expressions.back()->type == AST_EXPRESSION_CONSTANT
+					&& (block[j]->assignment.expressions.back()->constant->type == AST_CONSTANT_NIL
+						|| block[j]->assignment.expressions.back()->constant->type == AST_CONSTANT_FALSE)) {
 					conditionBuilder.add_node(ConditionBuilder::Node::FALSY_TEST, block[j]->instruction.label,
 						function.get_label_from_id(block[j + 1]->instruction.target), &block[j]->assignment.expressions);
-					break;
-				case AST_CONSTANT_TRUE:
-				case AST_CONSTANT_STRING:
-				case AST_CONSTANT_NUMBER:
+				} else {
 					conditionBuilder.add_node(ConditionBuilder::Node::TRUTHY_TEST, block[j]->instruction.label,
 						function.get_label_from_id(block[j + 1]->instruction.target), &block[j]->assignment.expressions);
-					break;
 				}
 
 				j++;
