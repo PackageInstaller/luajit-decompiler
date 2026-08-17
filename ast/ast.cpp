@@ -1687,21 +1687,33 @@ void Ast::eliminate_slots(Function& function, std::vector<Statement*>& block, Bl
 				j--
 				&& i
 				&& !function.is_valid_label(block[i]->instruction.label)
-				&& (block[i - 1]->type == AST_STATEMENT_ASSIGNMENT
-					|| (block[i - 1]->type == AST_STATEMENT_DECLARATION
-						&& (*block[i - 1]->assignment.variables.back().slotScope)->isSynthetic))
-				&& block[i - 1]->assignment.variables.size() == 1
-				&& block[i - 1]->assignment.variables.back().type == AST_VARIABLE_SLOT
-				&& (*block[i - 1]->assignment.variables.back().slotScope)->usages >= 1;) {
+				&& (block[i - 1]->type == AST_STATEMENT_GOTO
+					|| block[i - 1]->type == AST_STATEMENT_EMPTY
+					|| ((block[i - 1]->type == AST_STATEMENT_ASSIGNMENT
+						|| (block[i - 1]->type == AST_STATEMENT_DECLARATION
+							&& (*block[i - 1]->assignment.variables.back().slotScope)->isSynthetic))
+						&& block[i - 1]->assignment.variables.size() == 1
+						&& block[i - 1]->assignment.variables.back().type == AST_VARIABLE_SLOT
+						&& (*block[i - 1]->assignment.variables.back().slotScope)->usages >= 1));) {
+				uint32_t k = i - 1;
+				while (k >= 1
+					&& (block[k]->type == AST_STATEMENT_GOTO || block[k]->type == AST_STATEMENT_EMPTY)
+					&& !function.is_valid_label(block[k]->instruction.label)) {
+					k--;
+				}
+
 				auto label_safe = [&](const Statement* statement) -> bool {
 						if (!function.is_valid_label(statement->instruction.label)) return true;
 						// 跳转目标必须严格早于链起点(block[i-2]):
 						// 跳入路径会先执行 GGET/MOV 槽赋值, 内联安全; 若跳转目标落在链中间则跳过赋值, 不安全。
 						return function.labels[statement->instruction.label].target < block[i - 2]->instruction.id;
 					};
+				bool layoutApplied = false;
 				if (j == 1
 					&& block[i]->assignment.isPotentialMethod
 					&& i >= 2
+					&& block[i - 1]->type != AST_STATEMENT_GOTO
+					&& block[i - 1]->type != AST_STATEMENT_EMPTY
 					&& label_safe(block[i - 1])
 					&& label_safe(block[i - 2])
 					&& block[i - 1]->assignment.variables.back().slot == (*block[i]->assignment.openSlots.front())->variable->slot
@@ -1738,6 +1750,11 @@ void Ast::eliminate_slots(Function& function, std::vector<Statement*>& block, Bl
 					}
 					i--;
 					block.erase(block.begin() + i - 1);
+					// 布局位移了 block: 刷新 k 后落空到普通消除。布局把 openSlots[0]
+					// 换成 &table, 函数槽移到 openSlots[1](j==1), 普通消除以 j=1 把函数槽
+					// 替换为 TGETS 表达式(TABLE_INDEX), isMethod 输出才有效。
+					k = i - 1;
+					layoutApplied = true;
 				}
 
 				// 布局 B: 参数赋值夹在 TGETS 与 CALL 之间(如 f():m(1,2) 编译为
@@ -1746,6 +1763,8 @@ void Ast::eliminate_slots(Function& function, std::vector<Statement*>& block, Bl
 				if (j == 1
 					&& block[i]->assignment.isPotentialMethod
 					&& i >= 2
+					&& block[i - 1]->type != AST_STATEMENT_GOTO
+					&& block[i - 1]->type != AST_STATEMENT_EMPTY
 					&& label_safe(block[i - 1])
 					&& label_safe(block[i - 2])
 					&& block[i - 1]->assignment.variables.size() == 1
@@ -1785,13 +1804,21 @@ void Ast::eliminate_slots(Function& function, std::vector<Statement*>& block, Bl
 					}
 					i--;
 					block.erase(block.begin() + i);
+					// 同布局 A: 刷新 k 后落空, 以 j=1 替换函数槽。
+					k = i - 1;
+					layoutApplied = true;
 				}
 
-				if (block[i - 1]->assignment.variables.back().slot != (*block[i]->assignment.openSlots[j])->variable->slot) continue;
-				assert(block[i - 1]->assignment.variables.back().isMultres == (*block[i]->assignment.openSlots[j])->variable->isMultres,
+				if (!layoutApplied
+					&& (block[k]->type != AST_STATEMENT_ASSIGNMENT
+						&& !(block[k]->type == AST_STATEMENT_DECLARATION
+							&& block[k]->assignment.variables.size() == 1
+							&& (*block[k]->assignment.variables.back().slotScope)->isSynthetic))) break;
+				if (block[k]->assignment.variables.back().slot != (*block[i]->assignment.openSlots[j])->variable->slot) continue;
+				assert(block[k]->assignment.variables.back().isMultres == (*block[i]->assignment.openSlots[j])->variable->isMultres,
 					"Multres type mismatch when trying to eliminate slot", bytecode.filePath, DEBUG_INFO);
 				expression = *block[i]->assignment.openSlots[j];
-				*block[i]->assignment.openSlots[j] = block[i - 1]->assignment.expressions.back();
+				*block[i]->assignment.openSlots[j] = block[k]->assignment.expressions.back();
 
 				if (!j
 					&& block[i]->assignment.allowedConstantType != NUMBER_CONSTANT
@@ -1800,10 +1827,10 @@ void Ast::eliminate_slots(Function& function, std::vector<Statement*>& block, Bl
 					break;
 				}
 
-				function.slotScopeCollector.remove_scope(block[i - 1]->assignment.variables.back().slot, block[i - 1]->assignment.variables.back().slotScope);
-				block[i]->instruction.label = block[i - 1]->instruction.label;
-				i--;
-				block.erase(block.begin() + i);
+				function.slotScopeCollector.remove_scope(block[k]->assignment.variables.back().slot, block[k]->assignment.variables.back().slotScope);
+				block[i]->instruction.label = block[k]->instruction.label;
+				block.erase(block.begin() + k);
+				if (k < i) i--;
 			}
 		}
 
