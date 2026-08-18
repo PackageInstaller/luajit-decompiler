@@ -4,6 +4,14 @@
 [marsinator358/luajit-decompiler-v2](https://github.com/marsinator358/luajit-decompiler-v2)
 维护。条目按版本从新到旧排列。
 
+### v2.0.9  支配树空转修复
+
+- Lengauer-Tarjan 的 DFS 编号不再用 0 表示“未访问”（入口指令 id 也是 0）。
+  回边指向入口时会把入口重新入栈, 写出环状支配树,
+  `cfgDominates` 沿 idom 链走到死循环, 中等大小函数也会超过 30s 超时
+  （碧蓝航线 `WSAtlasWorld.lua` / `Dorm3dRoomScene.lua`）；
+- 支配查询改为欧拉序 O(1), 避免 7 万条指令的直线函数上 O(n²) 走链。
+
 ### v2.0.8  方法链折叠
 
 **方法链整体折叠**

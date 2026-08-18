@@ -995,29 +995,36 @@ std::vector<uint32_t> compute_cfg_idom(const Bytecode::Prototype& prototype) {
 	}
 
 	// Lengauer-Tarjan 支配树 (节点按 DFS 编号)。
-	std::vector<uint32_t> dfsNum(n, 0), vertex;         // 指令id -> DFS号; DFS号 -> 指令id
+	// dfsNum 用 UNVISITED 哨兵: 入口指令 id 为 0, 其 DFS 号也是 0,
+	// 不能再用 0 表示“未访问”, 否则回边指向入口时会把入口当成未发现节点,
+	// 写出环状支配树, cfgDominates 沿 idom 走会空转。
+	constexpr uint32_t UNVISITED = ~0u;
+	std::vector<uint32_t> dfsNum(n, UNVISITED), vertex; // 指令id -> DFS号; DFS号 -> 指令id
 	std::vector<uint32_t> parent(n, 0), semi(n, 0), idom(n, 0);
 	std::vector<uint32_t> ancestor(n, 0), label(n, 0);
 	std::vector<std::vector<uint32_t>> bucket(n);
 
 	uint32_t dfsCounter = 0;
 	// 迭代 DFS: 超长直线函数 (数万条指令) 递归会爆栈。
+	// 发现时立即编号, 保证 spanning tree 的 parent 只写一次。
 	{
 		std::vector<uint32_t> stack;
+		dfsNum[0] = 0;
+		vertex.push_back(0);
+		semi[0] = 0;
+		dfsCounter = 1;
 		stack.push_back(0);
 		while (!stack.empty()) {
 			const uint32_t v = stack.back();
 			stack.pop_back();
-			if (dfsNum[v]) continue;
-			dfsNum[v] = dfsCounter;
-			vertex.push_back(v);
-			dfsCounter++;
-			semi[v] = dfsNum[v];
 			for (uint32_t w : successors[v]) {
-				if (!dfsNum[w]) {
-					parent[w] = v;
-					stack.push_back(w);
-				}
+				if (dfsNum[w] != UNVISITED) continue;
+				dfsNum[w] = dfsCounter;
+				vertex.push_back(w);
+				semi[w] = dfsNum[w];
+				parent[w] = v;
+				dfsCounter++;
+				stack.push_back(w);
 			}
 		}
 	}
@@ -1050,7 +1057,7 @@ std::vector<uint32_t> compute_cfg_idom(const Bytecode::Prototype& prototype) {
 	for (uint32_t i = dfsCounter; i-- > 1;) {
 		const uint32_t w = vertex[i];
 		for (uint32_t v : predecessors[w]) {
-			if (!dfsNum[v]) continue;
+			if (dfsNum[v] == UNVISITED) continue;
 			const uint32_t u = eval(v);
 			if (semi[u] < semi[w]) semi[w] = semi[u];
 		}
@@ -1070,7 +1077,8 @@ std::vector<uint32_t> compute_cfg_idom(const Bytecode::Prototype& prototype) {
 	idom[vertex[0]] = vertex[0];
 
 	// 转回指令 id 索引: idomByIns[ins] = 直接支配者指令 id。
-	std::vector<uint32_t> idomByIns(n, 0);
+	// 不可达指令标为 UNVISITED, 避免与“被入口 (id 0) 直接支配”混淆。
+	std::vector<uint32_t> idomByIns(n, UNVISITED);
 	for (uint32_t i = 0; i < dfsCounter; i++) {
 		idomByIns[vertex[i]] = vertex[i] == 0 ? vertex[0] : idom[vertex[i]];
 	}
@@ -1102,18 +1110,18 @@ void Ast::propagate_cross_block_copies(Function& function) {
 	collect_written_scopes(function, writtenScopes);
 
 	// 支配树按需计算: 没有槽位引用候选时 (如纯常量大表函数) 跳过昂贵的 LT。
+	// 查询用欧拉序 O(1): 直线 7 万条指令的函数上沿 idom 链走是 O(n^2)。
 	std::vector<uint32_t> cfgIdom;
+	std::vector<uint32_t> idomIn;
+	std::vector<uint32_t> idomOut;
 	bool cfgIdomReady = false;
+	constexpr uint32_t IDUNREACHABLE = ~0u;
 	const auto cfgDominates = [&](uint32_t a, uint32_t b) -> bool {
 		if (a >= cfgIdom.size() || b >= cfgIdom.size()) return false;
 		if (a == b) return true;
-		if (b != 0 && cfgIdom[b] == 0) return false; // b 不可达
-		uint32_t current = b;
-		while (current != 0) {
-			current = cfgIdom[current];
-			if (current == a) return true;
-		}
-		return a == 0;
+		if (cfgIdom[b] == IDUNREACHABLE || cfgIdom[a] == IDUNREACHABLE) return false;
+		if (idomIn.empty()) return false;
+		return idomIn[a] <= idomIn[b] && idomOut[b] <= idomOut[a];
 	};
 
 	// 子函数 (闭包) 通过 upvalue 捕获父函数槽位: 这些引用不在当前函数树里,
@@ -1273,6 +1281,32 @@ void Ast::propagate_cross_block_copies(Function& function) {
 	if (!cfgIdomReady && !uses.empty()) {
 		cfgIdom = compute_cfg_idom(function.prototype);
 		cfgIdomReady = true;
+		const uint32_t n = (uint32_t)cfgIdom.size();
+		idomIn.assign(n, 0);
+		idomOut.assign(n, 0);
+		std::vector<std::vector<uint32_t>> children(n);
+		for (uint32_t i = 0; i < n; i++) {
+			if (cfgIdom[i] == IDUNREACHABLE || cfgIdom[i] == i) continue;
+			children[cfgIdom[i]].push_back(i);
+		}
+		uint32_t timer = 0;
+		std::vector<std::pair<uint32_t, uint32_t>> stack;
+		if (n && cfgIdom[0] != IDUNREACHABLE) {
+			stack.emplace_back(0, 0);
+			idomIn[0] = ++timer;
+			while (!stack.empty()) {
+				uint32_t v = stack.back().first;
+				uint32_t& idx = stack.back().second;
+				if (idx < children[v].size()) {
+					const uint32_t w = children[v][idx++];
+					idomIn[w] = ++timer;
+					stack.emplace_back(w, 0);
+				} else {
+					idomOut[v] = ++timer;
+					stack.pop_back();
+				}
+			}
+		}
 	}
 
 	// 4) 对每个单写入者作用域做支配检查并传播。
