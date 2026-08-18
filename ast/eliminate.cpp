@@ -929,11 +929,12 @@ std::vector<uint32_t> compute_cfg_idom(const Bytecode::Prototype& prototype) {
 
 	for (uint32_t i = 0; i < n; i++) {
 		const Bytecode::Instruction& ins = prototype.instructions[i];
-		const uint32_t target = i + (uint32_t)(ins.d - Bytecode::BC_OP_JMP_BIAS + 1);
 		bool jumps = false;
 		bool fallsThrough = true;
 
 		switch (ins.type) {
+		// LuaJIT 的 IS* 条件指令后紧跟一条 JMP (group_jumps 合并时把 JMP 删除、
+		// 目标抄给条件)。CFG 中: 条件分支跳转到下一条 JMP 的目标, 顺延落到 i+2。
 		case Bytecode::BC_OP_ISLT:
 		case Bytecode::BC_OP_ISGE:
 		case Bytecode::BC_OP_ISLE:
@@ -950,6 +951,12 @@ std::vector<uint32_t> compute_cfg_idom(const Bytecode::Prototype& prototype) {
 		case Bytecode::BC_OP_ISFC:
 		case Bytecode::BC_OP_IST:
 		case Bytecode::BC_OP_ISF:
+			if (i + 1 < n) {
+				const uint32_t jmpTarget = (i + 1) + (uint32_t)(prototype.instructions[i + 1].d - Bytecode::BC_OP_JMP_BIAS + 1);
+				addEdge(i, i + 2);
+				addEdge(i, jmpTarget);
+			}
+			continue;
 		case Bytecode::BC_OP_FORI:
 		case Bytecode::BC_OP_JFORI:
 		case Bytecode::BC_OP_FORL:
@@ -982,6 +989,7 @@ std::vector<uint32_t> compute_cfg_idom(const Bytecode::Prototype& prototype) {
 			break;
 		}
 
+		const uint32_t target = i + (uint32_t)(ins.d - Bytecode::BC_OP_JMP_BIAS + 1);
 		if (jumps) addEdge(i, target);
 		if (fallsThrough) addEdge(i, i + 1);
 	}
@@ -1134,6 +1142,8 @@ void Ast::propagate_cross_block_copies(Function& function) {
 	// 2) 收集单写入者作用域、多写入者集合、引用计数。
 	std::unordered_map<SlotScope*, Statement*> writerStatement;
 	std::unordered_set<SlotScope*> multiWriter;
+	std::unordered_map<uint8_t, std::vector<Statement*>> allWritersBySlot;
+	std::unordered_map<uint8_t, std::vector<Statement*>> pureWritersBySlot;
 
 	const auto collectWriter = [&](const auto& self, Statement* statement) -> void {
 		if (!statement) return;
@@ -1148,6 +1158,7 @@ void Ast::propagate_cross_block_copies(Function& function) {
 		}
 		for (const Variable& variable : statement->assignment.variables) {
 			if (variable.type != AST_VARIABLE_SLOT || !variable.slotScope || !*variable.slotScope) continue;
+			allWritersBySlot[variable.slot].emplace_back(statement);
 			SlotScope* scope = *variable.slotScope;
 			auto it = writerStatement.find(scope);
 			if (it == writerStatement.end()) {
@@ -1155,6 +1166,18 @@ void Ast::propagate_cross_block_copies(Function& function) {
 			} else if (it->second != statement) {
 				multiWriter.insert(scope);
 			}
+		}
+		// 纯 RHS 单槽写入者: 常量/全局/表索引等无副作用表达式, 即使作用域
+		// 被其它写入复用 (槽位合并), 支配 + 无中间重写时内联仍安全。
+		if (statement->instruction.label == INVALID_ID
+			&& statement->assignment.variables.size() == 1
+			&& statement->assignment.variables.back().type == AST_VARIABLE_SLOT
+			&& statement->assignment.variables.back().slotScope
+			&& *statement->assignment.variables.back().slotScope
+			&& statement->assignment.expressions.size() == 1
+			&& statement->assignment.expressions.back()
+			&& !expression_has_side_effects(statement->assignment.expressions.back())) {
+			pureWritersBySlot[statement->assignment.variables.back().slot].emplace_back(statement);
 		}
 		for (Statement* child : statement->block) self(self, child);
 	};
@@ -1172,15 +1195,18 @@ void Ast::propagate_cross_block_copies(Function& function) {
 
 	// 3) 收集所有槽位引用的树内位置 (Expression**) 及其所属语句。
 	std::unordered_map<const SlotScope*, std::vector<std::pair<Expression**, Statement*>>> uses;
+	std::unordered_map<uint8_t, std::vector<std::pair<Expression**, Statement*>>> usesBySlot;
 
 	const auto collectUses = [&](const auto& self, Expression** slot, Expression* expression, Statement* owner) -> void {
 		if (!expression) return;
 		switch (expression->type) {
 		case AST_EXPRESSION_VARIABLE:
-			if (expression->variable->type == AST_VARIABLE_SLOT
-				&& expression->variable->slotScope
-				&& *expression->variable->slotScope) {
-				uses[*expression->variable->slotScope].emplace_back(slot, owner);
+			if (expression->variable->type == AST_VARIABLE_SLOT) {
+				if (expression->variable->slotScope && *expression->variable->slotScope) {
+					uses[*expression->variable->slotScope].emplace_back(slot, owner);
+				}
+				// 槽位兜底不要求作用域非空: 合并别名/幽灵作用域同样按槽位安全传播。
+				usesBySlot[expression->variable->slot].emplace_back(slot, owner);
 			}
 			if (expression->variable->table) self(self, &expression->variable->table, expression->variable->table, owner);
 			if (expression->variable->tableIndex) self(self, &expression->variable->tableIndex, expression->variable->tableIndex, owner);
@@ -1284,11 +1310,17 @@ void Ast::propagate_cross_block_copies(Function& function) {
 
 	for (const auto& [scope, writer] : writerStatement) {
 		if (multiWriter.contains(scope)) continue;
-		if (!writer || writer->instruction.label != INVALID_ID) continue;
-		if (writer->assignment.expressions.size() != 1 || !writer->assignment.expressions.back()) continue;
+		if (!writer || writer->instruction.label != INVALID_ID) {
+			continue;
+		}
+		if (writer->assignment.expressions.size() != 1 || !writer->assignment.expressions.back()) {
+			continue;
+		}
 
 		Expression* rhs = writer->assignment.expressions.back();
-		if (expression_references_scope(rhs, scope)) continue;
+		if (expression_references_scope(rhs, scope)) {
+			continue;
+		}
 
 		// RHS 若是槽位引用, 要求其作用域最终会被命名 (参数或存在写入语句),
 		// 否则内联会留下 `var_<槽位>` 兜底名。
@@ -1304,29 +1336,79 @@ void Ast::propagate_cross_block_copies(Function& function) {
 		std::unordered_set<uint8_t> rhsSlots;
 		slotRefsInExpression(slotRefsInExpression, rhsSlots, rhs);
 
+		const uint8_t writerSlot = writer->assignment.variables.back().slot;
 		auto useIt = uses.find(scope);
-		if (useIt == uses.end()) continue;
-		auto& scopeUses = useIt->second;
+		bool slotFallback = false;
+		std::vector<std::pair<Expression**, Statement*>>* useList = nullptr;
+		if (useIt != uses.end()) {
+			useList = &useIt->second;
+		} else {
+			// 合并别名场景: 读取引用的作用域与写入作用域不是同一对象
+			// (如调试信息声明与后续赋值/读取的 SlotScope 分裂), 按槽位兜底。
+			auto slotIt = usesBySlot.find(writerSlot);
+			if (slotIt != usesBySlot.end()) {
+				useList = &slotIt->second;
+				slotFallback = true;
+			}
+		}
+		if (!useList) continue;
+		auto& scopeUses = *useList;
 
 		// 带副作用 RHS 只有在作用域仅一个使用点 (传播后可删除写入语句) 时才安全,
 		// 否则会把调用复制到多处。
-		if (impure && scopeUses.size() != 1) continue;
+		if (impure && scopeUses.size() != 1) {
+			continue;
+		}
 
 		std::vector<Expression**> pendingReplacements;
 		bool safe = true;
 
 		for (const auto& [ref, useStatement] : scopeUses) {
 			if (!useStatement) { safe = false; break; }
-
+	
 			// CFG 支配: 写入指令必须支配使用指令, 即从函数入口到使用点的
 			// 所有路径都经过写入者。这正确处理了 if 分支 + goto 合并点:
 			// 只有写入者所在路径才能到达使用点时, 传播是安全的。
-			if (writer->instruction.id == INVALID_ID
-				|| useStatement->instruction.id == INVALID_ID
-				|| !cfgDominates(writer->instruction.id, useStatement->instruction.id)) {
-				safe = false;
+			bool dominated = false;
+			if (writer->instruction.id != INVALID_ID && useStatement->instruction.id != INVALID_ID) {
+				dominated = cfgDominates(writer->instruction.id, useStatement->instruction.id);
+			} else if (useStatement->instruction.id != INVALID_ID) {
+				// 无指令 id 的声明 (调试信息 local): 用块内位置检查。
+				std::vector<Statement*>* writerBlock = ownerBlock[writer];
+				std::vector<Statement*>* useBlock = ownerBlock[useStatement];
+				if (writerBlock && writerBlock == useBlock
+					&& blockIndex[writer] < blockIndex[useStatement]) {
+					dominated = true;
+					for (size_t j = blockIndex[writer] + 1; j < blockIndex[useStatement]; j++) {
+						if ((*writerBlock)[j] && function.is_valid_label((*writerBlock)[j]->instruction.label)) {
+							dominated = false;
+							break;
+						}
+					}
+				}
+			}
+			if (!dominated) {
+						safe = false;
 				break;
 			}
+
+			// 槽位兜底时, 写入者与使用点之间不得有同槽位重写 (其它作用域也一样)。
+			if (slotFallback && writer->instruction.id != INVALID_ID && useStatement->instruction.id != INVALID_ID) {
+				const uint32_t begin = writer->instruction.id;
+				const uint32_t end = useStatement->instruction.id;
+				for (const auto& [otherScope, otherWriter] : writerStatement) {
+					if (!otherWriter || otherWriter == writer
+						|| otherWriter->instruction.id <= begin || otherWriter->instruction.id >= end) continue;
+					for (const Variable& variable : otherWriter->assignment.variables) {
+						if (variable.type == AST_VARIABLE_SLOT && variable.slot == writerSlot) {
+							safe = false;
+							break;
+						}
+					}
+					if (!safe) break;
+				}
+			}
+			if (!safe) break;
 
 			// 无中间改写: 写入者与使用点之间, RHS 引用的任何槽位不得被重新赋值。
 			if (!rhsSlots.empty() && writer->instruction.id != INVALID_ID && useStatement->instruction.id != INVALID_ID) {
@@ -1357,8 +1439,13 @@ void Ast::propagate_cross_block_copies(Function& function) {
 				|| !(*ref)->variable->slotScope) {
 				continue;
 			}
+			if (expression_references_scope(rhs, *(*ref)->variable->slotScope)) {
+				safe = false;
+				break;
+			}
 			*ref = rhs;
 		}
+		if (!safe) continue;
 
 		bool eraseWriter = false;
 		{
@@ -1369,8 +1456,10 @@ void Ast::propagate_cross_block_copies(Function& function) {
 					switch (expression->type) {
 					case AST_EXPRESSION_VARIABLE:
 						if (expression->variable->type == AST_VARIABLE_SLOT
-							&& expression->variable->slotScope
-							&& *expression->variable->slotScope == scope)
+							&& (slotFallback
+								? expression->variable->slot == writerSlot
+								: (expression->variable->slotScope
+									&& *expression->variable->slotScope == scope)))
 							count++;
 						if (expression->variable->table) self2(self2, expression->variable->table);
 						if (expression->variable->tableIndex) self2(self2, expression->variable->tableIndex);
@@ -1438,7 +1527,193 @@ void Ast::propagate_cross_block_copies(Function& function) {
 		}
 	}
 
-		return erasedAny;
+	// 5) 纯 RHS 槽位传播: 常量/全局等无副作用写入者, 即使作用域被多写入
+	//    (槽位复用/与真局部合并, 如 `local var_6_0 = 2` 与 value 共享槽),
+	//    只要写入者支配使用点且中间无同槽重写, 内联依然安全。
+	for (const auto& [slot, writers] : pureWritersBySlot) {
+		auto slotUseIt = usesBySlot.find(slot);
+		if (slotUseIt == usesBySlot.end()) continue;
+		auto& slotUses = slotUseIt->second;
+
+		for (Statement* writer : writers) {
+			// 单写入者作用域已由上一轮处理。
+			SlotScope* writerScope = *writer->assignment.variables.back().slotScope;
+			auto scopeIt = writerStatement.find(writerScope);
+			if (scopeIt != writerStatement.end()
+				&& scopeIt->second == writer
+				&& !multiWriter.contains(writerScope))
+				continue;
+
+			Expression* rhs = writer->assignment.expressions.back();
+			std::unordered_set<uint8_t> rhsSlots;
+			slotRefsInExpression(slotRefsInExpression, rhsSlots, rhs);
+
+			std::vector<Expression**> pendingReplacements;
+			bool safe = true;
+
+			for (const auto& [ref, useStatement] : slotUses) {
+				if (!useStatement) { safe = false; break; }
+
+				// 支配: CFG (真实指令 id) 或块内位置 (无 id 声明)。
+				bool dominated = false;
+				if (writer->instruction.id != INVALID_ID && useStatement->instruction.id != INVALID_ID) {
+					dominated = cfgDominates(writer->instruction.id, useStatement->instruction.id);
+				} else if (useStatement->instruction.id != INVALID_ID) {
+					std::vector<Statement*>* writerBlock = ownerBlock[writer];
+					std::vector<Statement*>* useBlock = ownerBlock[useStatement];
+					if (writerBlock && writerBlock == useBlock
+						&& blockIndex[writer] < blockIndex[useStatement]) {
+						dominated = true;
+						for (size_t j = blockIndex[writer] + 1; j < blockIndex[useStatement]; j++) {
+							if ((*writerBlock)[j] && function.is_valid_label((*writerBlock)[j]->instruction.label)) {
+								dominated = false;
+								break;
+							}
+						}
+					}
+				}
+				if (!dominated) { safe = false; break; }
+
+				// 写入者与使用点之间不得有同槽位重写。
+				if (writer->instruction.id != INVALID_ID && useStatement->instruction.id != INVALID_ID) {
+					const uint32_t begin = writer->instruction.id;
+					const uint32_t end = useStatement->instruction.id;
+					for (Statement* other : allWritersBySlot[slot]) {
+						if (!other || other == writer
+							|| other->instruction.id == INVALID_ID
+							|| other->instruction.id <= begin || other->instruction.id >= end) continue;
+						safe = false;
+						break;
+					}
+				} else {
+					std::vector<Statement*>* writerBlock = ownerBlock[writer];
+					std::vector<Statement*>* useBlock = ownerBlock[useStatement];
+					if (writerBlock && writerBlock == useBlock) {
+						for (size_t j = blockIndex[writer] + 1; j < blockIndex[useStatement]; j++) {
+							Statement* between = (*writerBlock)[j];
+							if (!between) continue;
+							for (const Variable& variable : between->assignment.variables) {
+								if (variable.type == AST_VARIABLE_SLOT && variable.slot == slot) {
+									safe = false;
+									break;
+								}
+							}
+							if (!safe) break;
+						}
+					}
+				}
+				if (!safe) break;
+
+				// RHS 引用的槽位不得在写入者与使用点之间被重写。
+				if (!rhsSlots.empty() && writer->instruction.id != INVALID_ID && useStatement->instruction.id != INVALID_ID) {
+					const uint32_t begin = writer->instruction.id;
+					const uint32_t end = useStatement->instruction.id;
+					for (const auto& [otherScope, otherWriter] : writerStatement) {
+						if (!otherWriter || otherWriter == writer
+							|| otherWriter->instruction.id <= begin || otherWriter->instruction.id >= end) continue;
+						for (const Variable& variable : otherWriter->assignment.variables) {
+							if (variable.type == AST_VARIABLE_SLOT && rhsSlots.contains(variable.slot)) {
+								safe = false;
+								break;
+							}
+						}
+						if (!safe) break;
+					}
+				}
+				if (!safe) break;
+
+				pendingReplacements.emplace_back(ref);
+			}
+
+			if (!safe || pendingReplacements.empty()) continue;
+
+			for (Expression** ref : pendingReplacements) {
+				if (!*ref || (*ref)->type != AST_EXPRESSION_VARIABLE
+					|| (*ref)->variable->type != AST_VARIABLE_SLOT) {
+					continue;
+				}
+				if ((*ref)->variable->slotScope
+					&& *(*ref)->variable->slotScope
+					&& expression_references_scope(rhs, *(*ref)->variable->slotScope)) {
+					safe = false;
+					break;
+				}
+				*ref = rhs;
+			}
+			if (!safe) continue;
+
+			// 按槽位统计剩余引用, 无引用且未被闭包捕获时删除写入者。
+			uint32_t remaining = 0;
+			const auto countSlot = [&](const auto& self2, const Expression* expression) -> void {
+				if (!expression) return;
+				switch (expression->type) {
+				case AST_EXPRESSION_VARIABLE:
+					if (expression->variable->type == AST_VARIABLE_SLOT && expression->variable->slot == slot) remaining++;
+					if (expression->variable->table) self2(self2, expression->variable->table);
+					if (expression->variable->tableIndex) self2(self2, expression->variable->tableIndex);
+					break;
+				case AST_EXPRESSION_FUNCTION_CALL:
+					self2(self2, expression->functionCall->function);
+					for (const Expression* arg : expression->functionCall->arguments) self2(self2, arg);
+					if (expression->functionCall->multresArgument) self2(self2, expression->functionCall->multresArgument);
+					break;
+				case AST_EXPRESSION_TABLE:
+					for (const auto& field : expression->table->fields) {
+						self2(self2, field.key);
+						self2(self2, field.value);
+					}
+					if (expression->table->multresField) self2(self2, expression->table->multresField);
+					break;
+				case AST_EXPRESSION_BINARY_OPERATION:
+					self2(self2, expression->binaryOperation->leftOperand);
+					self2(self2, expression->binaryOperation->rightOperand);
+					break;
+				case AST_EXPRESSION_UNARY_OPERATION:
+					self2(self2, expression->unaryOperation->operand);
+					break;
+				default: break;
+				}
+			};
+			const auto countStmt = [&](const auto& self2, const Statement* statement) -> void {
+				if (!statement) return;
+				for (const Expression* expression : statement->assignment.expressions) countSlot(countSlot, expression);
+				if (statement->assignment.multresReturn) countSlot(countSlot, statement->assignment.multresReturn);
+				for (const Variable& variable : statement->assignment.variables) {
+					countSlot(countSlot, variable.table);
+					countSlot(countSlot, variable.tableIndex);
+				}
+				for (const Statement* child : statement->block) self2(self2, child);
+			};
+			const auto walkRoot = [&](std::vector<Statement*>& block) -> void {
+				for (Statement* statement : block) {
+					if (statement) countStmt(countStmt, statement);
+				}
+			};
+			walkRoot(function.block);
+
+			if (remaining == 0 && !capturedScopes.contains(writerScope)) {
+				erasedAny = true;
+				function.slotScopeCollector.remove_scope(writer->assignment.variables.back().slot, writer->assignment.variables.back().slotScope);
+				auto blockIt = ownerBlock[writer];
+				if (blockIt) {
+					auto& blk = *blockIt;
+					size_t erasedIndex = 0;
+					for (size_t j = 0; j < blk.size(); j++) {
+						if (blk[j] == writer) {
+							erasedIndex = j;
+							blk.erase(blk.begin() + j);
+							break;
+						}
+					}
+					for (auto& [statement, index] : blockIndex) {
+						if (ownerBlock[statement] == blockIt && index > erasedIndex) index--;
+					}
+				}
+			}
+		}
+	}
+
+	return erasedAny;
 	};
 
 	while (onePass()) {}
