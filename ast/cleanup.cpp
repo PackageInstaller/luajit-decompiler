@@ -326,6 +326,22 @@ bool Ast::expressions_equal(const Expression& a, const Expression& b) {
 		return a.binaryOperation->type == b.binaryOperation->type
 			&& expressions_equal(*a.binaryOperation->leftOperand, *b.binaryOperation->leftOperand)
 			&& expressions_equal(*a.binaryOperation->rightOperand, *b.binaryOperation->rightOperand);
+	case AST_EXPRESSION_FUNCTION_CALL: {
+		if (!a.functionCall || !b.functionCall) return false;
+		if (a.functionCall->isMethod != b.functionCall->isMethod) return false;
+		if (a.functionCall->arguments.size() != b.functionCall->arguments.size()) return false;
+		if (!a.functionCall->function || !b.functionCall->function) return false;
+		if (!expressions_equal(*a.functionCall->function, *b.functionCall->function)) return false;
+		for (size_t i = 0; i < a.functionCall->arguments.size(); i++) {
+			if (!a.functionCall->arguments[i] || !b.functionCall->arguments[i]) return false;
+			if (!expressions_equal(*a.functionCall->arguments[i], *b.functionCall->arguments[i])) return false;
+		}
+		if (bool(a.functionCall->multresArgument) != bool(b.functionCall->multresArgument)) return false;
+		if (a.functionCall->multresArgument
+			&& !expressions_equal(*a.functionCall->multresArgument, *b.functionCall->multresArgument))
+			return false;
+		return true;
+	}
 	default:
 		break;
 	}

@@ -58,7 +58,7 @@ private:
 	void eliminate_slots(Function& function, std::vector<Statement*>& block, BlockInfo* const& previousBlock);
 	void eliminate_slots(Function& function, std::vector<Statement*>& block, BlockInfo* const& previousBlock, std::unordered_map<const SlotScope*, uint32_t>& refCounts, std::unordered_set<const SlotScope*>& writtenScopes);
 	void propagate_cross_block_copies(Function& function);
-	void restore_method_calls(Function& function, std::vector<Statement*>& block);
+	bool restore_method_calls(Function& function, std::vector<Statement*>& block);
 	void eliminate_conditions(Function& function, std::vector<Statement*>& block, BlockInfo* const& previousBlock);
 	void build_multi_assignment(Function& function, std::vector<Statement*>& block);
 	void build_if_statements_from_map(Function& function, std::vector<Statement*>& block, BlockInfo* const& previousBlock, std::unordered_map<Statement*, uint32_t>& offsetMap);

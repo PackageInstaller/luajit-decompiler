@@ -72,9 +72,13 @@ void Ast::build_functions(Function& function, uint32_t& functionCounter) {
 	eliminate_conditions(function, function.block, nullptr);
 	// build_multi_assignment 在 eliminate_conditions 末尾执行: 传播放在其后,
 	// 避免删除多返回值合并窗口内的语句破坏其位置索引。
+	// 方法还原会把 `obj.m(obj, ...)` 的双次引用收成一次, 随后传播才能内联
+	// 接收者; 反过来传播内联拷贝后才会出现新的方法模式。交替直到不动点。
+	for (int pass = 0; pass < 4; pass++) {
+		propagate_cross_block_copies(function);
+		if (!restore_method_calls(function, function.block)) break;
+	}
 	propagate_cross_block_copies(function);
-	// 传播内联接收者后, 再跑一次方法还原, 把新内联的接收者转成 `obj:method()`。
-	restore_method_calls(function, function.block);
 	build_if_statements(function, function.block, nullptr);
 	clean_up(function);
 	fixup_labels(function);

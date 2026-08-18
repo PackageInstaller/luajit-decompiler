@@ -3,7 +3,7 @@
 // 各 pass 之间共享的内部辅助函数 (声明; 定义在 ast/eliminate.cpp)。
 // 注意: 本头文件不包含 main.h, 引用前必须已包含之。
 
-
+#include <algorithm>
 #include "ast_internal.h"
 
 void Ast::eliminate_slots(Function& function, std::vector<Statement*>& block, BlockInfo* const& previousBlock) {
@@ -1719,11 +1719,145 @@ void Ast::propagate_cross_block_copies(Function& function) {
 	while (onePass()) {}
 }
 
-void Ast::restore_method_calls(Function& function, std::vector<Statement*>& block) {
+bool Ast::restore_method_calls(Function& function, std::vector<Statement*>& block) {
+	bool changed = false;
+
+	struct SlotCopy {
+		uint32_t index = INVALID_ID;
+		Expression* rhs = nullptr;
+		bool unique = true;
+	};
+	std::unordered_map<uint8_t, SlotCopy> copies;
+	std::unordered_set<uint8_t> consumedCopySlots;
+
 	for (uint32_t i = 0; i < block.size(); i++) {
 		Statement* statement = block[i];
 		if (!statement) continue;
-		if (!statement->block.empty()) restore_method_calls(function, statement->block);
+		if ((statement->type != AST_STATEMENT_ASSIGNMENT && statement->type != AST_STATEMENT_DECLARATION)
+			|| statement->assignment.variables.size() != 1
+			|| statement->assignment.expressions.size() != 1
+			|| statement->assignment.variables.back().type != AST_VARIABLE_SLOT)
+			continue;
+		Expression* rhs = statement->assignment.expressions.back();
+		if (!rhs) continue;
+		const uint8_t toSlot = statement->assignment.variables.back().slot;
+		auto it = copies.find(toSlot);
+		if (it == copies.end()) {
+			copies[toSlot] = { .index = i, .rhs = rhs, .unique = true };
+		} else {
+			it->second.unique = false;
+		}
+	}
+
+	const auto argMatchesReceiver = [&](const Expression* arg, const Expression* receiver) -> bool {
+		if (!arg || !receiver) return false;
+		if (expressions_equal(*arg, *receiver)) return true;
+		if (arg->type != AST_EXPRESSION_VARIABLE || arg->variable->type != AST_VARIABLE_SLOT) return false;
+		auto it = copies.find(arg->variable->slot);
+		if (it == copies.end() || !it->second.unique || !it->second.rhs) return false;
+		return expressions_equal(*it->second.rhs, *receiver);
+	};
+
+	// 模式: 函数位置是 `接收者.字段` (TGETS), 第一个参数就是接收者本身
+	// (或编译器为方法调用插入的 MOV 副本), 还原为 `接收者:字段(...)`。
+	const auto tryRestore = [&](FunctionCall* functionCall) -> bool {
+		if (!functionCall || functionCall->isMethod || functionCall->arguments.empty()) return false;
+		Expression* fn = functionCall->function;
+		if (!fn || fn->type != AST_EXPRESSION_VARIABLE || fn->variable->type != AST_VARIABLE_TABLE_INDEX) return false;
+		if (!fn->variable->tableIndex || fn->variable->tableIndex->type != AST_EXPRESSION_CONSTANT
+			|| !fn->variable->tableIndex->constant->isName)
+			return false;
+
+		Expression* receiver = fn->variable->table;
+		if (!receiver) return false;
+		if (!argMatchesReceiver(functionCall->arguments.front(), receiver)) return false;
+
+		for (size_t j = 1; j < functionCall->arguments.size(); j++) {
+			if (argMatchesReceiver(functionCall->arguments[j], receiver)) return false;
+		}
+
+		if (functionCall->arguments.front()->type == AST_EXPRESSION_VARIABLE
+			&& functionCall->arguments.front()->variable->type == AST_VARIABLE_SLOT
+			&& !expressions_equal(*functionCall->arguments.front(), *receiver)) {
+			consumedCopySlots.insert(functionCall->arguments.front()->variable->slot);
+		}
+
+		functionCall->isMethod = true;
+		functionCall->arguments.erase(functionCall->arguments.begin());
+		return true;
+	};
+
+	const auto walkExpression = [&](const auto& self, Expression* expression) -> void {
+		if (!expression) return;
+		switch (expression->type) {
+		case AST_EXPRESSION_VARIABLE:
+			self(self, expression->variable->table);
+			self(self, expression->variable->tableIndex);
+			break;
+		case AST_EXPRESSION_FUNCTION_CALL:
+			self(self, expression->functionCall->function);
+			for (Expression* argument : expression->functionCall->arguments) self(self, argument);
+			self(self, expression->functionCall->multresArgument);
+			if (tryRestore(expression->functionCall)) changed = true;
+			break;
+		case AST_EXPRESSION_TABLE:
+			for (auto& field : expression->table->fields) {
+				self(self, field.key);
+				self(self, field.value);
+			}
+			self(self, expression->table->multresField);
+			break;
+		case AST_EXPRESSION_BINARY_OPERATION:
+			self(self, expression->binaryOperation->leftOperand);
+			self(self, expression->binaryOperation->rightOperand);
+			break;
+		case AST_EXPRESSION_UNARY_OPERATION:
+			self(self, expression->unaryOperation->operand);
+			break;
+		default:
+			break;
+		}
+	};
+
+	for (uint32_t i = 0; i < block.size(); i++) {
+		Statement* statement = block[i];
+		if (!statement) continue;
+		if (!statement->block.empty() && restore_method_calls(function, statement->block)) changed = true;
+		for (Expression* expression : statement->assignment.expressions) walkExpression(walkExpression, expression);
+		walkExpression(walkExpression, statement->assignment.multresReturn);
+		for (Variable& variable : statement->assignment.variables) {
+			walkExpression(walkExpression, variable.table);
+			walkExpression(walkExpression, variable.tableIndex);
+		}
+	}
+
+	// 方法还原后, 仅为 self 副本存在的 MOV 若已无引用则删除。
+	// 只删 tryRestore 真正消耗过的副本, 避免把普通赋值当成拷贝清掉。
+	std::vector<uint32_t> eraseCopies;
+	for (const auto& [toSlot, copy] : copies) {
+		if (!copy.unique || copy.index >= block.size() || !consumedCopySlots.contains(toSlot)) continue;
+		if (copy.rhs && expression_has_side_effects(copy.rhs)) continue;
+		Statement* writer = block[copy.index];
+		if (!writer || writer->assignment.variables.size() != 1) continue;
+		if (!writer->assignment.variables.back().slotScope || !*writer->assignment.variables.back().slotScope) continue;
+		SlotScope* scope = *writer->assignment.variables.back().slotScope;
+		if (count_scope_reads_in_block(function.block, scope) == 0) eraseCopies.emplace_back(copy.index);
+	}
+	if (!eraseCopies.empty()) {
+		std::sort(eraseCopies.begin(), eraseCopies.end(), std::greater<>());
+		for (uint32_t index : eraseCopies) {
+			Statement* writer = block[index];
+			function.slotScopeCollector.remove_scope(writer->assignment.variables.back().slot, writer->assignment.variables.back().slotScope);
+			block.erase(block.begin() + index);
+			changed = true;
+		}
+	}
+
+	// 语句级方法调用的接收者若来自紧邻的单用途槽赋值, 进一步内联。
+	// 循环体第一条语句常带入口标签: 内联时把标签转给使用点, 语义不变。
+	for (uint32_t i = 0; i < block.size(); i++) {
+		Statement* statement = block[i];
+		if (!statement) continue;
 
 		FunctionCall* functionCall = nullptr;
 		if ((statement->type == AST_STATEMENT_FUNCTION_CALL
@@ -1731,54 +1865,26 @@ void Ast::restore_method_calls(Function& function, std::vector<Statement*>& bloc
 				|| statement->type == AST_STATEMENT_DECLARATION)
 			&& statement->assignment.expressions.size() == 1
 			&& statement->assignment.expressions.back()
-			&& statement->assignment.expressions.back()->type == AST_EXPRESSION_FUNCTION_CALL) {
+			&& statement->assignment.expressions.back()->type == AST_EXPRESSION_FUNCTION_CALL
+			&& statement->assignment.expressions.back()->functionCall->isMethod) {
 			functionCall = statement->assignment.expressions.back()->functionCall;
 		} else if (statement->type == AST_STATEMENT_RETURN
 			&& statement->assignment.multresReturn
-			&& statement->assignment.multresReturn->type == AST_EXPRESSION_FUNCTION_CALL) {
+			&& statement->assignment.multresReturn->type == AST_EXPRESSION_FUNCTION_CALL
+			&& statement->assignment.multresReturn->functionCall->isMethod) {
 			functionCall = statement->assignment.multresReturn->functionCall;
 		}
 
-		if (!functionCall || functionCall->isMethod || functionCall->arguments.empty()) continue;
+		if (!functionCall) continue;
 
-		// 模式: 函数位置是 `接收者.字段` (TGETS), 第一个参数就是接收者本身
-		// (方法调用的 self 副本), 还原为 `接收者:字段(...)`。
 		Expression* fn = functionCall->function;
 		if (!fn || fn->type != AST_EXPRESSION_VARIABLE || fn->variable->type != AST_VARIABLE_TABLE_INDEX) continue;
-		if (!fn->variable->tableIndex || fn->variable->tableIndex->type != AST_EXPRESSION_CONSTANT
-			|| !fn->variable->tableIndex->constant->isName)
-			continue;
-
 		Expression* receiver = fn->variable->table;
-		if (!receiver) continue;
-		const bool receiverIsVariable = receiver->type == AST_EXPRESSION_VARIABLE
-			&& (receiver->variable->type == AST_VARIABLE_SLOT || receiver->variable->type == AST_VARIABLE_UPVALUE);
-		const bool receiverIsTableIndex = receiver->type == AST_EXPRESSION_VARIABLE
-			&& receiver->variable->type == AST_VARIABLE_TABLE_INDEX;
-		if (!receiverIsVariable && !receiverIsTableIndex)
-			continue;
-		if (!expressions_equal(*functionCall->arguments.front(), *receiver)) continue;
-
-		bool ambiguous = false;
-		for (size_t j = 1; j < functionCall->arguments.size(); j++) {
-			if (expressions_equal(*functionCall->arguments[j], *receiver)) {
-				ambiguous = true;
-				break;
-			}
-		}
-		if (ambiguous) continue;
-
-		functionCall->isMethod = true;
-		functionCall->arguments.erase(functionCall->arguments.begin());
-
-		// 接收者若来自紧邻的单用途槽赋值 (UGET/GGET/TGETS 结果), 进一步内联,
-		// 消除 `local var = self.list; self.list:push(...)` 中的接收者临时变量。
-		if (!receiverIsVariable || receiver->variable->type != AST_VARIABLE_SLOT) continue;
-
+		if (!receiver || receiver->type != AST_EXPRESSION_VARIABLE || receiver->variable->type != AST_VARIABLE_SLOT) continue;
+		if (!receiver->variable->slotScope || !*receiver->variable->slotScope) continue;
 		SlotScope* receiverScope = *receiver->variable->slotScope;
-		if (!receiverScope) continue;
-		uint32_t writer = INVALID_ID;
 
+		uint32_t writer = INVALID_ID;
 		for (uint32_t k = i, scanned = 0; k-- > 0 && scanned < 64;) {
 			scanned++;
 			Statement* previous = block[k];
@@ -1786,15 +1892,15 @@ void Ast::restore_method_calls(Function& function, std::vector<Statement*>& bloc
 				if (function.is_valid_label(previous->instruction.label)) break;
 				continue;
 			}
-			if ((previous->type == AST_STATEMENT_ASSIGNMENT
-					|| (previous->type == AST_STATEMENT_DECLARATION
-						&& (*previous->assignment.variables.back().slotScope)->isSynthetic))
+			if ((previous->type == AST_STATEMENT_ASSIGNMENT || previous->type == AST_STATEMENT_DECLARATION)
 				&& previous->assignment.variables.size() == 1
 				&& previous->assignment.expressions.size() == 1
 				&& previous->assignment.variables.back().type == AST_VARIABLE_SLOT
 				&& previous->assignment.variables.back().slot == receiver->variable->slot
-				&& !function.is_valid_label(previous->instruction.label)
-				&& count_scope_reads_in_block(block, receiverScope) == 1) {
+				&& count_scope_reads_in_block(function.block, receiverScope) == 1) {
+				if (function.is_valid_label(previous->instruction.label)
+					&& function.is_valid_label(statement->instruction.label))
+					break;
 				writer = k;
 				break;
 			}
@@ -1805,11 +1911,19 @@ void Ast::restore_method_calls(Function& function, std::vector<Statement*>& bloc
 
 		Statement* writerStatement = block[writer];
 		Expression* rhs = writerStatement->assignment.expressions.back();
-		if (expression_references_scope(rhs, receiverScope)) continue;
+		if (!rhs || expression_references_scope(rhs, receiverScope)) continue;
+
+		if (function.is_valid_label(writerStatement->instruction.label)
+			&& !function.is_valid_label(statement->instruction.label)) {
+			statement->instruction.label = writerStatement->instruction.label;
+		}
 
 		fn->variable->table = rhs;
 		function.slotScopeCollector.remove_scope(writerStatement->assignment.variables.back().slot, writerStatement->assignment.variables.back().slotScope);
 		block.erase(block.begin() + writer);
 		i--;
+		changed = true;
 	}
+
+	return changed;
 }
