@@ -2631,7 +2631,9 @@ void Ast::propagate_cross_block_copies(Function& function) {
 	std::unordered_set<const SlotScope*> writtenScopes;
 	collect_written_scopes(function, writtenScopes);
 
-	const std::vector<uint32_t> cfgIdom = compute_cfg_idom(function.prototype);
+	// 支配树按需计算: 没有槽位引用候选时 (如纯常量大表函数) 跳过昂贵的 LT。
+	std::vector<uint32_t> cfgIdom;
+	bool cfgIdomReady = false;
 	const auto cfgDominates = [&](uint32_t a, uint32_t b) -> bool {
 		if (a >= cfgIdom.size() || b >= cfgIdom.size()) return false;
 		if (a == b) return true;
@@ -2777,6 +2779,12 @@ void Ast::propagate_cross_block_copies(Function& function) {
 			}
 		};
 		walkRoot(walkRoot, function.block);
+	}
+
+	// 支配树按需计算: 没有槽位引用候选时 (如纯常量大表函数) 跳过昂贵的 LT。
+	if (!cfgIdomReady && !uses.empty()) {
+		cfgIdom = compute_cfg_idom(function.prototype);
+		cfgIdomReady = true;
 	}
 
 	// 4) 对每个单写入者作用域做支配检查并传播。
