@@ -68,6 +68,8 @@ void Ast::build_functions(Function& function, uint32_t& functionCounter) {
 	}
 	assert(function.slotScopeCollector.assert_scopes_closed(), "Failed to close slot scopes", bytecode.filePath, DEBUG_INFO);
 	eliminate_slots(function, function.block, nullptr);
+	propagate_cross_block_copies(function);
+	restore_method_calls(function, function.block);
 	eliminate_conditions(function, function.block, nullptr);
 	build_if_statements(function, function.block, nullptr);
 	clean_up(function);
@@ -1531,7 +1533,22 @@ bool Ast::has_self_reference(const uint8_t& targetSlot, Expression* const& expre
 	return false;
 }
 
+static bool expression_references_scope(const Ast::Expression* expression, const Ast::SlotScope* scope);
+static bool expression_references_slot(const Ast::Expression* expression, const uint8_t slot);
+static bool expression_has_side_effects(const Ast::Expression* expression);
+static uint32_t count_scope_reads_in_block(const std::vector<Ast::Statement*>& block, const Ast::SlotScope* scope);
+static void collect_scope_reads(const Ast::Function& function, std::unordered_map<const Ast::SlotScope*, uint32_t>& refCounts);
+static void collect_written_scopes(const Ast::Function& function, std::unordered_set<const Ast::SlotScope*>& writtenScopes);
+
 void Ast::eliminate_slots(Function& function, std::vector<Statement*>& block, BlockInfo* const& previousBlock) {
+	std::unordered_map<const SlotScope*, uint32_t> refCounts;
+	collect_scope_reads(function, refCounts);
+	std::unordered_set<const SlotScope*> writtenScopes;
+	collect_written_scopes(function, writtenScopes);
+	eliminate_slots(function, block, previousBlock, refCounts, writtenScopes);
+}
+
+void Ast::eliminate_slots(Function& function, std::vector<Statement*>& block, BlockInfo* const& previousBlock, std::unordered_map<const SlotScope*, uint32_t>& refCounts, std::unordered_set<const SlotScope*>& writtenScopes) {
 	BlockInfo blockInfo = { .block = block, .previousBlock = previousBlock };
 	Expression* expression;
 	uint32_t index, targetIndex, targetLabel, extendedTargetLabel;
@@ -1560,6 +1577,7 @@ void Ast::eliminate_slots(Function& function, std::vector<Statement*>& block, Bl
 			while (i && !function.is_valid_label(block[i]->instruction.label)) {
 				switch (block[i - 1]->type) {
 				case AST_STATEMENT_ASSIGNMENT:
+					if (!block[i]->assignment.openSlots.size()) break;
 					if (block[i - 1]->assignment.variables.front().slot <= block[i]->assignment.expressions[block[i]->assignment.openSlots.size() - 1]->variable->slot) break;
 					assert(block[i - 1]->assignment.variables.size() == 1 && !(*block[i - 1]->assignment.variables.back().slotScope)->usages, "Invalid expression list assignment", bytecode.filePath, DEBUG_INFO);
 				case AST_STATEMENT_FUNCTION_CALL:
@@ -1599,6 +1617,7 @@ void Ast::eliminate_slots(Function& function, std::vector<Statement*>& block, Bl
 				break;
 			}
 
+			if (block[i]->type == AST_STATEMENT_DECLARATION) goto eliminate_function_call_open_slots;
 			break;
 		case AST_STATEMENT_ASSIGNMENT:
 		case AST_STATEMENT_FUNCTION_CALL:
@@ -1676,6 +1695,7 @@ void Ast::eliminate_slots(Function& function, std::vector<Statement*>& block, Bl
 			&& block[i - 1]->function
 			&& block[i - 1]->function->assignmentSlotIsUpvalue
 			&& block[i - 1]->assignment.variables.back().slot == (*block[i]->assignment.openSlots.back())->variable->slot) {
+			if (SlotScope* openScope = *(*block[i]->assignment.openSlots.back())->variable->slotScope) refCounts[openScope]--;
 			*block[i]->assignment.openSlots.back() = block[i - 1]->assignment.expressions.back();
 			*block[i - 1]->assignment.variables.back().slotScope = *block[i]->assignment.variables.back().slotScope;
 			block[i]->instruction.label = block[i - 1]->instruction.label;
@@ -1683,154 +1703,150 @@ void Ast::eliminate_slots(Function& function, std::vector<Statement*>& block, Bl
 			function.slotScopeCollector.remove_scope(block[i]->assignment.variables.back().slot, block[i]->assignment.variables.back().slotScope);
 			block.erase(block.begin() + i);
 		} else {
-			for (uint8_t j = block[i]->assignment.openSlots.size();
-				j--
-				&& i
-				&& !function.is_valid_label(block[i]->instruction.label)
-				&& (block[i - 1]->type == AST_STATEMENT_GOTO
-					|| block[i - 1]->type == AST_STATEMENT_EMPTY
-					|| ((block[i - 1]->type == AST_STATEMENT_ASSIGNMENT
-						|| (block[i - 1]->type == AST_STATEMENT_DECLARATION
-							&& (*block[i - 1]->assignment.variables.back().slotScope)->isSynthetic))
-						&& block[i - 1]->assignment.variables.size() == 1
-						&& block[i - 1]->assignment.variables.back().type == AST_VARIABLE_SLOT
-						&& (*block[i - 1]->assignment.variables.back().slotScope)->usages >= 1));) {
-				uint32_t k = i - 1;
-				while (k >= 1
-					&& (block[k]->type == AST_STATEMENT_GOTO || block[k]->type == AST_STATEMENT_EMPTY)
-					&& !function.is_valid_label(block[k]->instruction.label)) {
-					k--;
+			// 广义临时槽消除: 使用点前连续的单用途槽赋值链整体内联。
+			//   local var_0 = table.insert
+			//   local var_1 = fragment
+			//   var_0(var_1, ...)
+			// -> table.insert(fragment, ...)
+			if (i && !function.is_valid_label(block[i]->instruction.label) && block[i]->assignment.openSlots.size()) {
+				// 按槽位收集 open slot (沿用原逻辑, 只处理原始开放槽, 不做递归内联)。
+				std::unordered_map<uint8_t, std::vector<Expression**>> openSlotsBySlot;
+				std::unordered_map<Expression**, uint8_t> openSlotIndex;
+
+				for (uint8_t j = 0; j < block[i]->assignment.openSlots.size(); j++) {
+					Expression* slotExpression = *block[i]->assignment.openSlots[j];
+					if (!slotExpression || slotExpression->type != AST_EXPRESSION_VARIABLE
+						|| slotExpression->variable->type != AST_VARIABLE_SLOT)
+						continue;
+					openSlotsBySlot[slotExpression->variable->slot].emplace_back(block[i]->assignment.openSlots[j]);
+					openSlotIndex[block[i]->assignment.openSlots[j]] = j;
 				}
 
-				auto label_safe = [&](const Statement* statement) -> bool {
-						if (!function.is_valid_label(statement->instruction.label)) return true;
-						// 跳转目标必须严格早于链起点(block[i-2]):
-						// 跳入路径会先执行 GGET/MOV 槽赋值, 内联安全; 若跳转目标落在链中间则跳过赋值, 不安全。
-						return function.labels[statement->instruction.label].target < block[i - 2]->instruction.id;
-					};
-				bool layoutApplied = false;
-				if (j == 1
-					&& block[i]->assignment.isPotentialMethod
-					&& i >= 2
-					&& block[i - 1]->type != AST_STATEMENT_GOTO
-					&& block[i - 1]->type != AST_STATEMENT_EMPTY
-					&& label_safe(block[i - 1])
-					&& label_safe(block[i - 2])
-					&& block[i - 1]->assignment.variables.back().slot == (*block[i]->assignment.openSlots.front())->variable->slot
-					&& block[i - 1]->assignment.expressions.back()->type == AST_EXPRESSION_VARIABLE
-					&& block[i - 1]->assignment.expressions.back()->variable->type == AST_VARIABLE_TABLE_INDEX
-					&& block[i - 1]->assignment.expressions.back()->variable->table->type == AST_EXPRESSION_VARIABLE
-					&& block[i - 1]->assignment.expressions.back()->variable->table->variable->type == AST_VARIABLE_SLOT
-					&& block[i - 1]->assignment.expressions.back()->variable->tableIndex->type == AST_EXPRESSION_CONSTANT
-					&& block[i - 1]->assignment.expressions.back()->variable->tableIndex->constant->isName
-					&& block[i - 2]->type == AST_STATEMENT_ASSIGNMENT
-					&& block[i - 2]->assignment.variables.size() == 1
-					&& block[i - 2]->assignment.variables.back().type == AST_VARIABLE_SLOT
-					&& (*block[i - 2]->assignment.variables.back().slotScope)->usages == 1
-					&& block[i - 2]->assignment.variables.back().slot == (*block[i]->assignment.openSlots[j])->variable->slot
-					&& block[i - 2]->assignment.expressions.size() == 1
-					&& block[i - 2]->assignment.expressions.back()->type == AST_EXPRESSION_VARIABLE
-					&& block[i - 2]->assignment.expressions.back()->variable->type != AST_VARIABLE_TABLE_INDEX) {
-					block[i - 1]->assignment.expressions.back()->variable->table = block[i - 2]->assignment.expressions.back();
-					if (block[i]->type == AST_STATEMENT_RETURN) {
-						block[i]->assignment.multresReturn->functionCall->isMethod = true;
-						block[i]->assignment.multresReturn->functionCall->arguments.erase(block[i]->assignment.multresReturn->functionCall->arguments.begin());
-					} else {
-						block[i]->assignment.expressions.back()->functionCall->isMethod = true;
-						block[i]->assignment.expressions.back()->functionCall->arguments.erase(block[i]->assignment.expressions.back()->functionCall->arguments.begin());
+				// 向后扫描连续窗口: 允许 GOTO/EMPTY 与单变量 SLOT 赋值。
+				// 限制扫描深度, 避免超长连续赋值链导致 O(n^2)。
+				constexpr uint32_t MAX_WINDOW = 64;
+				std::vector<uint32_t> window;
+				for (uint32_t k = i; k-- > 0 && window.size() < MAX_WINDOW;) {
+					Statement* previous = block[k];
+					if (previous->type == AST_STATEMENT_GOTO || previous->type == AST_STATEMENT_EMPTY) {
+						if (function.is_valid_label(previous->instruction.label)) break;
+						window.emplace_back(k);
+						continue;
 					}
-
-					block[i]->assignment.openSlots.erase(block[i]->assignment.openSlots.begin() + j);
-					block[i]->assignment.openSlots.emplace(block[i]->assignment.openSlots.begin(), &block[i - 1]->assignment.expressions.back()->variable->table);
-					function.slotScopeCollector.remove_scope(block[i - 2]->assignment.variables.back().slot, block[i - 2]->assignment.variables.back().slotScope);
-					block[i - 1]->instruction.label = block[i - 2]->instruction.label;
-					if (block[i - 2]->assignment.expressions.back()->type == AST_EXPRESSION_VARIABLE
-						&& block[i - 2]->assignment.expressions.back()->variable->type == AST_VARIABLE_SLOT) {
-						(*block[i - 2]->assignment.expressions.back()->variable->slotScope)->usages--;
+					if ((previous->type == AST_STATEMENT_ASSIGNMENT
+							|| (previous->type == AST_STATEMENT_DECLARATION
+								&& (*previous->assignment.variables.back().slotScope)->isSynthetic))
+						&& previous->assignment.variables.size() == 1
+						&& previous->assignment.expressions.size() == 1
+						&& previous->assignment.variables.back().type == AST_VARIABLE_SLOT) {
+						window.emplace_back(k);
+						// 带跳转标签的赋值只允许作为整条链的起点: 跳入后从起点顺序执行,
+						// 内联到使用点后语义不变; 标签落在链中间则跳过前置赋值, 不安全。
+						if (function.is_valid_label(previous->instruction.label)) break;
+						continue;
 					}
-					i--;
-					block.erase(block.begin() + i - 1);
-					// 布局位移了 block: 刷新 k 后落空到普通消除。布局把 openSlots[0]
-					// 换成 &table, 函数槽移到 openSlots[1](j==1), 普通消除以 j=1 把函数槽
-					// 替换为 TGETS 表达式(TABLE_INDEX), isMethod 输出才有效。
-					k = i - 1;
-					layoutApplied = true;
-				}
-
-				// 布局 B: 参数赋值夹在 TGETS 与 CALL 之间(如 f():m(1,2) 编译为
-				// TGETS fn; KSHORT/KSTR 参数; CALL)。参数槽消除后 i-1=MOV(self 副本),
-				// i-2=TGETS(方法槽), 与布局 A(i-1=TGETS, i-2=MOV) 顺序相反。
-				if (j == 1
-					&& block[i]->assignment.isPotentialMethod
-					&& i >= 2
-					&& block[i - 1]->type != AST_STATEMENT_GOTO
-					&& block[i - 1]->type != AST_STATEMENT_EMPTY
-					&& label_safe(block[i - 1])
-					&& label_safe(block[i - 2])
-					&& block[i - 1]->assignment.variables.size() == 1
-					&& block[i - 1]->assignment.variables.back().type == AST_VARIABLE_SLOT
-					&& (*block[i - 1]->assignment.variables.back().slotScope)->usages == 1
-					&& block[i - 1]->assignment.variables.back().slot == (*block[i]->assignment.openSlots[j])->variable->slot
-					&& block[i - 1]->assignment.expressions.size() == 1
-					&& block[i - 1]->assignment.expressions.back()->type == AST_EXPRESSION_VARIABLE
-					&& block[i - 1]->assignment.expressions.back()->variable->type == AST_VARIABLE_SLOT
-					&& block[i - 2]->assignment.variables.size() == 1
-					&& block[i - 2]->assignment.variables.back().type == AST_VARIABLE_SLOT
-					&& block[i - 2]->assignment.variables.back().slot == (*block[i]->assignment.openSlots.front())->variable->slot
-					&& block[i - 2]->assignment.expressions.size() == 1
-					&& block[i - 2]->assignment.expressions.back()->type == AST_EXPRESSION_VARIABLE
-					&& block[i - 2]->assignment.expressions.back()->variable->type == AST_VARIABLE_TABLE_INDEX
-					&& block[i - 2]->assignment.expressions.back()->variable->table->type == AST_EXPRESSION_VARIABLE
-					&& block[i - 2]->assignment.expressions.back()->variable->table->variable->type == AST_VARIABLE_SLOT
-					&& block[i - 2]->assignment.expressions.back()->variable->table->variable->slot == block[i - 1]->assignment.expressions.back()->variable->slot
-					&& block[i - 2]->assignment.expressions.back()->variable->tableIndex->type == AST_EXPRESSION_CONSTANT
-					&& block[i - 2]->assignment.expressions.back()->variable->tableIndex->constant->isName) {
-					block[i - 2]->assignment.expressions.back()->variable->table = block[i - 1]->assignment.expressions.back();
-					if (block[i]->type == AST_STATEMENT_RETURN) {
-						block[i]->assignment.multresReturn->functionCall->isMethod = true;
-						block[i]->assignment.multresReturn->functionCall->arguments.erase(block[i]->assignment.multresReturn->functionCall->arguments.begin());
-					} else {
-						block[i]->assignment.expressions.back()->functionCall->isMethod = true;
-						block[i]->assignment.expressions.back()->functionCall->arguments.erase(block[i]->assignment.expressions.back()->functionCall->arguments.begin());
-					}
-
-					block[i]->assignment.openSlots.erase(block[i]->assignment.openSlots.begin() + j);
-					block[i]->assignment.openSlots.emplace(block[i]->assignment.openSlots.begin(), &block[i - 2]->assignment.expressions.back()->variable->table);
-					function.slotScopeCollector.remove_scope(block[i - 1]->assignment.variables.back().slot, block[i - 1]->assignment.variables.back().slotScope);
-					block[i - 2]->instruction.label = block[i - 1]->instruction.label;
-					if (block[i - 1]->assignment.expressions.back()->type == AST_EXPRESSION_VARIABLE
-						&& block[i - 1]->assignment.expressions.back()->variable->type == AST_VARIABLE_SLOT) {
-						(*block[i - 1]->assignment.expressions.back()->variable->slotScope)->usages--;
-					}
-					i--;
-					block.erase(block.begin() + i);
-					// 同布局 A: 刷新 k 后落空, 以 j=1 替换函数槽。
-					k = i - 1;
-					layoutApplied = true;
-				}
-
-				if (!layoutApplied
-					&& (block[k]->type != AST_STATEMENT_ASSIGNMENT
-						&& !(block[k]->type == AST_STATEMENT_DECLARATION
-							&& block[k]->assignment.variables.size() == 1
-							&& (*block[k]->assignment.variables.back().slotScope)->isSynthetic))) break;
-				if (block[k]->assignment.variables.back().slot != (*block[i]->assignment.openSlots[j])->variable->slot) continue;
-				assert(block[k]->assignment.variables.back().isMultres == (*block[i]->assignment.openSlots[j])->variable->isMultres,
-					"Multres type mismatch when trying to eliminate slot", bytecode.filePath, DEBUG_INFO);
-				expression = *block[i]->assignment.openSlots[j];
-				*block[i]->assignment.openSlots[j] = block[k]->assignment.expressions.back();
-
-				if (!j
-					&& block[i]->assignment.allowedConstantType != NUMBER_CONSTANT
-					&& get_constant_type(block[i]->assignment.expressions.back()) > block[i]->assignment.allowedConstantType) {
-					*block[i]->assignment.openSlots[j] = expression;
 					break;
 				}
 
-				function.slotScopeCollector.remove_scope(block[k]->assignment.variables.back().slot, block[k]->assignment.variables.back().slotScope);
-				block[i]->instruction.label = block[k]->instruction.label;
-				block.erase(block.begin() + k);
-				if (k < i) i--;
+				std::unordered_set<uint8_t> matchedSlots;
+				std::unordered_set<uint32_t> eraseIndices;
+
+				for (uint32_t candidateIndex : window) {
+					Statement* candidate = block[candidateIndex];
+					if (candidate->type != AST_STATEMENT_ASSIGNMENT && candidate->type != AST_STATEMENT_DECLARATION) continue;
+
+					const uint8_t slot = candidate->assignment.variables.back().slot;
+					auto openSlotIt = openSlotsBySlot.find(slot);
+					if (openSlotIt == openSlotsBySlot.end() || matchedSlots.contains(slot)) continue;
+					// 同一槽被使用点引用多次时, 内联会重复求值, 保留临时变量。
+					if (openSlotIt->second.size() != 1) continue;
+
+					Expression* rhs = candidate->assignment.expressions.back();
+					SlotScope* slotScope = *candidate->assignment.variables.back().slotScope;
+
+					// 多返回值位置只能内联多返回值调用; 反过来单值位置允许内联多返回值调用
+					// (多余返回值被丢弃, 与原 `local x = f(); g(x)` 语义一致)。
+					bool multresUse = false;
+					for (Expression** openSlot : openSlotIt->second) {
+						if ((*openSlot)->variable->isMultres) multresUse = true;
+					}
+					if (multresUse && !candidate->assignment.variables.back().isMultres) continue;
+
+					// RHS 若是槽位引用, 要求其作用域最终会被命名 (已有名字或存在写入语句),
+					// 否则内联会留下 `var_<槽位>` 兜底名 (写入语句被合并/消除的幽灵作用域)。
+					if (rhs->type == AST_EXPRESSION_VARIABLE && rhs->variable->type == AST_VARIABLE_SLOT) {
+						SlotScope* rhsScope = *rhs->variable->slotScope;
+						const uint8_t rhsSlot = rhs->variable->slot;
+						const bool rhsIsParameter = rhsSlot < function.slotScopeCollector.slotInfos.size()
+							&& function.slotScopeCollector.slotInfos[rhsSlot].isParameter;
+						if (!rhsScope || (!rhsIsParameter && !writtenScopes.contains(rhsScope))) continue;
+					}
+
+					// 自引用或依赖窗口内其它将被内联的槽 -> 跳过, 保持求值顺序。
+					bool unsafe = expression_references_scope(rhs, slotScope);
+					for (uint32_t otherIndex : window) {
+						if (unsafe) break;
+						Statement* other = block[otherIndex];
+						if (other->type != AST_STATEMENT_ASSIGNMENT && other->type != AST_STATEMENT_DECLARATION) continue;
+						const uint8_t otherSlot = other->assignment.variables.back().slot;
+						if (otherSlot == slot || !openSlotsBySlot.contains(otherSlot)) continue;
+						if (expression_references_slot(rhs, otherSlot)) unsafe = true;
+					}
+					if (unsafe) continue;
+
+					// 函数位置的常量类型限制 (沿用原逻辑)。
+					bool isFunctionPosition = false;
+					for (Expression** openSlot : openSlotIt->second) {
+						if (openSlotIndex[openSlot] == 0) isFunctionPosition = true;
+					}
+					if (isFunctionPosition
+						&& block[i]->assignment.allowedConstantType != NUMBER_CONSTANT
+						&& get_constant_type(rhs) > block[i]->assignment.allowedConstantType)
+						continue;
+
+					// DECLARATION 的开放槽是局部变量初始化占位符: 若写入语句与声明变量
+					// 是同一作用域, 这是 `local x = <rhs>` 的初始化合并, 即使 x 后续
+					// 还有引用也应删除写入语句 (引用统一落到声明变量上)。
+					bool mergeIntoDeclaration = false;
+					if (block[i]->type == AST_STATEMENT_DECLARATION) {
+						for (const Variable& variable : block[i]->assignment.variables) {
+							if (variable.type == AST_VARIABLE_SLOT
+								&& variable.slotScope
+								&& *variable.slotScope == slotScope) {
+								mergeIntoDeclaration = true;
+								break;
+							}
+						}
+					}
+
+					// 只有写入语句会被删除 (无剩余引用/初始化合并) 时才允许内联
+					// 带副作用的 RHS; 否则多用途临时槽的内联会把调用复制到使用点,
+					// 导致重复执行。
+					const bool willEraseWriter = mergeIntoDeclaration || refCounts[slotScope] == 1;
+					if (!willEraseWriter && expression_has_side_effects(rhs)) continue;
+
+					for (Expression** openSlot : openSlotIt->second) {
+						// 递减的是开放槽实际引用的作用域计数 (可能与写入语句作用域不同)。
+						SlotScope* openSlotScope = *(*openSlot)->variable->slotScope;
+						if (openSlotScope) refCounts[openSlotScope]--;
+						*openSlot = rhs;
+					}
+					matchedSlots.insert(slot);
+
+					if (willEraseWriter) eraseIndices.insert(candidateIndex);
+				}
+
+				if (eraseIndices.size()) {
+					std::vector<uint32_t> sortedErases(eraseIndices.begin(), eraseIndices.end());
+					std::sort(sortedErases.begin(), sortedErases.end(), std::greater<>());
+
+					for (uint32_t k : sortedErases) {
+						function.slotScopeCollector.remove_scope(block[k]->assignment.variables.back().slot, block[k]->assignment.variables.back().slotScope);
+						block[i]->instruction.label = block[k]->instruction.label;
+						block.erase(block.begin() + k);
+						if (k < i) i--;
+					}
+				}
 			}
 		}
 
@@ -1839,18 +1855,19 @@ void Ast::eliminate_slots(Function& function, std::vector<Statement*>& block, Bl
 			&& (*block[i]->assignment.openSlots.back())->variable->isMultres) {
 			// 某些字节码变体的 TSETM 值可能不是多返回值调用 (如直接写数字常量),
 			// 无法消除时保留槽位引用, 由写出阶段输出 `t[k] = 槽值`。
+			if (SlotScope* openScope = *(*block[i]->assignment.openSlots.back())->variable->slotScope) refCounts[openScope]--;
 			block[i]->assignment.openSlots.pop_back();
 		}
 
 		switch (block[i]->type) {
 		case AST_STATEMENT_NUMERIC_FOR:
 		case AST_STATEMENT_GENERIC_FOR:
-			eliminate_slots(function, block[i]->block, nullptr);
+			eliminate_slots(function, block[i]->block, nullptr, refCounts, writtenScopes);
 			break;
 		case AST_STATEMENT_LOOP:
 		case AST_STATEMENT_DECLARATION:
 			blockInfo.index = i;
-			eliminate_slots(function, block[i]->block, &blockInfo);
+			eliminate_slots(function, block[i]->block, &blockInfo, refCounts, writtenScopes);
 			break;
 		case AST_STATEMENT_ASSIGNMENT:
 			if (block[i]->assignment.variables.size() == 1) {
@@ -2177,6 +2194,14 @@ void Ast::eliminate_slots(Function& function, std::vector<Statement*>& block, Bl
 								block[i - 1]->assignment.expressions.back()->table->fields.back().value = block[i]->assignment.expressions.back();
 							}
 
+							// 被合并语句的 table/tableIndex 读取从树中移除, 同步递减引用表;
+							// value 表达式移入构造器, 计数不变。
+							if (SlotScope* tableScope = *block[i]->assignment.variables.back().table->variable->slotScope) refCounts[tableScope]--;
+							if (block[i]->assignment.variables.back().tableIndex
+								&& block[i]->assignment.variables.back().tableIndex->type == AST_EXPRESSION_VARIABLE
+								&& block[i]->assignment.variables.back().tableIndex->variable->type == AST_VARIABLE_SLOT) {
+								if (SlotScope* indexScope = *block[i]->assignment.variables.back().tableIndex->variable->slotScope) refCounts[indexScope]--;
+							}
 							(*block[i - 1]->assignment.variables.back().slotScope)->usages--;
 							block.erase(block.begin() + i);
 							i -= 2;
@@ -2184,6 +2209,7 @@ void Ast::eliminate_slots(Function& function, std::vector<Statement*>& block, Bl
 						}
 
 						if (!block[i]->assignment.variables.back().isMultres && (*block[i - 1]->assignment.variables.back().slotScope)->usages == 1) {
+							if (SlotScope* tableScope = *block[i]->assignment.variables.back().table->variable->slotScope) refCounts[tableScope]--;
 							block[i]->assignment.variables.back().table = block[i - 1]->assignment.expressions.back();
 							function.slotScopeCollector.remove_scope(block[i - 1]->assignment.variables.back().slot, block[i - 1]->assignment.variables.back().slotScope);
 							block[i]->instruction.label = block[i - 1]->instruction.label;
@@ -2203,6 +2229,731 @@ void Ast::eliminate_slots(Function& function, std::vector<Statement*>& block, Bl
 
 			break;
 		}
+	}
+}
+
+static bool expression_references_scope(const Ast::Expression* expression, const Ast::SlotScope* scope) {
+	if (!expression || !scope) return false;
+
+	switch (expression->type) {
+	case Ast::AST_EXPRESSION_VARIABLE:
+		if (expression->variable->type == Ast::AST_VARIABLE_SLOT
+			&& expression->variable->slotScope
+			&& *expression->variable->slotScope == scope)
+			return true;
+		if (expression_references_scope(expression->variable->table, scope)) return true;
+		return expression_references_scope(expression->variable->tableIndex, scope);
+	case Ast::AST_EXPRESSION_FUNCTION_CALL:
+		if (expression_references_scope(expression->functionCall->function, scope)) return true;
+		for (const Ast::Expression* argument : expression->functionCall->arguments) {
+			if (expression_references_scope(argument, scope)) return true;
+		}
+		return expression_references_scope(expression->functionCall->multresArgument, scope);
+	case Ast::AST_EXPRESSION_TABLE:
+		for (const auto& field : expression->table->fields) {
+			if (expression_references_scope(field.key, scope) || expression_references_scope(field.value, scope)) return true;
+		}
+		return expression_references_scope(expression->table->multresField, scope);
+	case Ast::AST_EXPRESSION_BINARY_OPERATION:
+		return expression_references_scope(expression->binaryOperation->leftOperand, scope)
+			|| expression_references_scope(expression->binaryOperation->rightOperand, scope);
+	case Ast::AST_EXPRESSION_UNARY_OPERATION:
+		return expression_references_scope(expression->unaryOperation->operand, scope);
+	default:
+		break;
+	}
+
+	return false;
+}
+
+static bool expression_references_slot(const Ast::Expression* expression, const uint8_t slot) {
+	if (!expression) return false;
+
+	switch (expression->type) {
+	case Ast::AST_EXPRESSION_VARIABLE:
+		if (expression->variable->type == Ast::AST_VARIABLE_SLOT && expression->variable->slot == slot) return true;
+		if (expression_references_slot(expression->variable->table, slot)) return true;
+		return expression_references_slot(expression->variable->tableIndex, slot);
+	case Ast::AST_EXPRESSION_FUNCTION_CALL:
+		if (expression_references_slot(expression->functionCall->function, slot)) return true;
+		for (const Ast::Expression* argument : expression->functionCall->arguments) {
+			if (expression_references_slot(argument, slot)) return true;
+		}
+		return expression_references_slot(expression->functionCall->multresArgument, slot);
+	case Ast::AST_EXPRESSION_TABLE:
+		for (const auto& field : expression->table->fields) {
+			if (expression_references_slot(field.key, slot) || expression_references_slot(field.value, slot)) return true;
+		}
+		return expression_references_slot(expression->table->multresField, slot);
+	case Ast::AST_EXPRESSION_BINARY_OPERATION:
+		return expression_references_slot(expression->binaryOperation->leftOperand, slot)
+			|| expression_references_slot(expression->binaryOperation->rightOperand, slot);
+	case Ast::AST_EXPRESSION_UNARY_OPERATION:
+		return expression_references_slot(expression->unaryOperation->operand, slot);
+	default:
+		break;
+	}
+
+	return false;
+}
+
+static bool expression_has_side_effects(const Ast::Expression* expression) {
+	if (!expression) return false;
+
+	switch (expression->type) {
+	case Ast::AST_EXPRESSION_FUNCTION_CALL:
+		return true;
+	case Ast::AST_EXPRESSION_VARARG:
+		return true;
+	case Ast::AST_EXPRESSION_VARIABLE:
+		if (expression_has_side_effects(expression->variable->table)) return true;
+		return expression_has_side_effects(expression->variable->tableIndex);
+	case Ast::AST_EXPRESSION_TABLE:
+		if (expression->table->multresField) return true;
+		for (const auto& field : expression->table->fields) {
+			if (expression_has_side_effects(field.key) || expression_has_side_effects(field.value)) return true;
+		}
+		return false;
+	case Ast::AST_EXPRESSION_BINARY_OPERATION:
+		return expression_has_side_effects(expression->binaryOperation->leftOperand)
+			|| expression_has_side_effects(expression->binaryOperation->rightOperand);
+	case Ast::AST_EXPRESSION_UNARY_OPERATION:
+		return expression_has_side_effects(expression->unaryOperation->operand);
+	default:
+		break;
+	}
+
+	return false;
+}
+
+static uint32_t count_scope_reads_in_block(const std::vector<Ast::Statement*>& block, const Ast::SlotScope* scope) {
+	uint32_t count = 0;
+
+	const auto walkExpression = [&](const auto& self, const Ast::Expression* expression) -> void {
+		if (!expression) return;
+		switch (expression->type) {
+		case Ast::AST_EXPRESSION_VARIABLE:
+			if (expression->variable->type == Ast::AST_VARIABLE_SLOT
+				&& expression->variable->slotScope
+				&& *expression->variable->slotScope == scope)
+				count++;
+			if (expression->variable->table) self(self, expression->variable->table);
+			if (expression->variable->tableIndex) self(self, expression->variable->tableIndex);
+			break;
+		case Ast::AST_EXPRESSION_FUNCTION_CALL:
+			self(self, expression->functionCall->function);
+			for (const Ast::Expression* argument : expression->functionCall->arguments) self(self, argument);
+			if (expression->functionCall->multresArgument) self(self, expression->functionCall->multresArgument);
+			break;
+		case Ast::AST_EXPRESSION_TABLE:
+			for (const auto& field : expression->table->fields) {
+				self(self, field.key);
+				self(self, field.value);
+			}
+			if (expression->table->multresField) self(self, expression->table->multresField);
+			break;
+		case Ast::AST_EXPRESSION_BINARY_OPERATION:
+			self(self, expression->binaryOperation->leftOperand);
+			self(self, expression->binaryOperation->rightOperand);
+			break;
+		case Ast::AST_EXPRESSION_UNARY_OPERATION:
+			self(self, expression->unaryOperation->operand);
+			break;
+		default:
+			break;
+		}
+	};
+
+	const auto walkStatement = [&](const auto& self, const Ast::Statement* statement) -> void {
+		if (!statement) return;
+		for (const Ast::Expression* expression : statement->assignment.expressions) walkExpression(walkExpression, expression);
+		for (const Ast::Variable& variable : statement->assignment.variables) {
+			walkExpression(walkExpression, variable.table);
+			walkExpression(walkExpression, variable.tableIndex);
+		}
+		if (statement->assignment.multresReturn) walkExpression(walkExpression, statement->assignment.multresReturn);
+		for (const Ast::Statement* child : statement->block) self(self, child);
+	};
+
+	for (const Ast::Statement* statement : block) walkStatement(walkStatement, statement);
+	return count;
+}
+
+static void collect_scope_reads(const Ast::Function& function, std::unordered_map<const Ast::SlotScope*, uint32_t>& refCounts) {
+	const auto walkExpression = [&](const auto& self, const Ast::Expression* expression) -> void {
+		if (!expression) return;
+		switch (expression->type) {
+		case Ast::AST_EXPRESSION_VARIABLE:
+			if (expression->variable->type == Ast::AST_VARIABLE_SLOT
+				&& expression->variable->slotScope
+				&& *expression->variable->slotScope)
+				refCounts[*expression->variable->slotScope]++;
+			if (expression->variable->table) self(self, expression->variable->table);
+			if (expression->variable->tableIndex) self(self, expression->variable->tableIndex);
+			break;
+		case Ast::AST_EXPRESSION_FUNCTION_CALL:
+			self(self, expression->functionCall->function);
+			for (const Ast::Expression* argument : expression->functionCall->arguments) self(self, argument);
+			if (expression->functionCall->multresArgument) self(self, expression->functionCall->multresArgument);
+			break;
+		case Ast::AST_EXPRESSION_TABLE:
+			for (const auto& field : expression->table->fields) {
+				self(self, field.key);
+				self(self, field.value);
+			}
+			if (expression->table->multresField) self(self, expression->table->multresField);
+			break;
+		case Ast::AST_EXPRESSION_BINARY_OPERATION:
+			self(self, expression->binaryOperation->leftOperand);
+			self(self, expression->binaryOperation->rightOperand);
+			break;
+		case Ast::AST_EXPRESSION_UNARY_OPERATION:
+			self(self, expression->unaryOperation->operand);
+			break;
+		default:
+			break;
+		}
+	};
+
+	const auto walkStatement = [&](const auto& self, const Ast::Statement* statement) -> void {
+		if (!statement) return;
+		for (const Ast::Expression* expression : statement->assignment.expressions) walkExpression(walkExpression, expression);
+		for (const Ast::Variable& variable : statement->assignment.variables) {
+			walkExpression(walkExpression, variable.table);
+			walkExpression(walkExpression, variable.tableIndex);
+		}
+		if (statement->assignment.multresReturn) walkExpression(walkExpression, statement->assignment.multresReturn);
+		for (const Ast::Statement* child : statement->block) self(self, child);
+	};
+
+	for (const Ast::Statement* statement : function.block) walkStatement(walkStatement, statement);
+}
+
+static void collect_written_scopes(const Ast::Function& function, std::unordered_set<const Ast::SlotScope*>& writtenScopes) {
+	const auto walkStatement = [&](const auto& self, const Ast::Statement* statement) -> void {
+		if (!statement) return;
+		for (const Ast::Variable& variable : statement->assignment.variables) {
+			if (variable.type == Ast::AST_VARIABLE_SLOT && variable.slotScope && *variable.slotScope) {
+				writtenScopes.insert(*variable.slotScope);
+			}
+		}
+		for (const Ast::Statement* child : statement->block) self(self, child);
+	};
+
+	for (const Ast::Statement* statement : function.block) walkStatement(walkStatement, statement);
+}
+
+void Ast::propagate_cross_block_copies(Function& function) {
+	// 跨块拷贝传播: 编译器为方法调用/表达式生成的临时槽可能横跨 goto/label
+	// 重构出的多个块 (如 `local var = self.list` 在 if 分支, 使用在合并后的块),
+	// 单趟链消除的连续窗口够不到。这里用块树支配 + 无中间改写做保守传播。
+	// 固定点: 一轮传播内联可能引入新的跨块引用, 迭代直到不再有写入者被删除,
+	// 避免 A 内联引入的 B 引用赶不上 B 的删除判定而留下幽灵槽。
+	std::unordered_set<const SlotScope*> writtenScopes;
+	collect_written_scopes(function, writtenScopes);
+
+	// 子函数 (闭包) 通过 upvalue 捕获父函数槽位: 这些引用不在当前函数树里,
+	// 删除写入者会让闭包内的引用变成无名幽灵槽, 因此捕获的作用域不删除写入者。
+	std::unordered_set<const SlotScope*> capturedScopes;
+	{
+		const auto collectCaptured = [&](const auto& self, const Function& fn) -> void {
+			for (const Function* child : fn.childFunctions) {
+				for (const Function::Upvalue& upvalue : child->upvalues) {
+					if (upvalue.slotScope && *upvalue.slotScope) {
+						capturedScopes.insert(*upvalue.slotScope);
+					}
+				}
+				self(self, *child);
+			}
+		};
+		collectCaptured(collectCaptured, function);
+	}
+
+	const auto onePass = [&]() -> bool {
+		bool erasedAny = false;
+
+	// 1) 建立语句的父块/父语句/块内下标关系。
+	std::unordered_map<Statement*, std::vector<Statement*>*> ownerBlock;
+	std::unordered_map<Statement*, Statement*> ownerStatement;
+	std::unordered_map<Statement*, size_t> blockIndex;
+
+	const auto buildParent = [&](const auto& self, std::vector<Statement*>& block, Statement* owner) -> void {
+		for (size_t j = 0; j < block.size(); j++) {
+			Statement* statement = block[j];
+			if (!statement) continue;
+			ownerBlock[statement] = &block;
+			ownerStatement[statement] = owner;
+			blockIndex[statement] = j;
+			if (!statement->block.empty()) self(self, statement->block, statement);
+		}
+	};
+	buildParent(buildParent, function.block, nullptr);
+
+	// 2) 收集单写入者作用域、多写入者集合、引用计数。
+	std::unordered_map<SlotScope*, Statement*> writerStatement;
+	std::unordered_set<SlotScope*> multiWriter;
+	std::unordered_map<const SlotScope*, uint32_t> refCounts;
+
+	const auto collectWriter = [&](const auto& self, Statement* statement) -> void {
+		if (!statement) return;
+		// 多变量语句 (多返回值 CALL 等) 的结果槽由 build_multi_assignment 合并,
+		// 整体删除会连累其它结果槽, 一律不参与传播。
+		if (statement->assignment.variables.size() != 1) {
+			for (const Variable& variable : statement->assignment.variables) {
+				if (variable.type == AST_VARIABLE_SLOT && variable.slotScope && *variable.slotScope) {
+					multiWriter.insert(*variable.slotScope);
+				}
+			}
+		}
+		for (const Variable& variable : statement->assignment.variables) {
+			if (variable.type != AST_VARIABLE_SLOT || !variable.slotScope || !*variable.slotScope) continue;
+			SlotScope* scope = *variable.slotScope;
+			auto it = writerStatement.find(scope);
+			if (it == writerStatement.end()) {
+				writerStatement[scope] = statement;
+			} else if (it->second != statement) {
+				multiWriter.insert(scope);
+			}
+		}
+		for (Statement* child : statement->block) self(self, child);
+	};
+	{
+		const auto walkRoot = [&](const auto& self, std::vector<Statement*>& blk) -> void {
+			for (Statement* statement : blk) {
+				if (statement) {
+					collectWriter(collectWriter, statement);
+					if (!statement->block.empty()) self(self, statement->block);
+				}
+			}
+		};
+		walkRoot(walkRoot, function.block);
+	}
+
+	// 3) 收集所有槽位引用的树内位置 (Expression**) 及其所属语句。
+	std::unordered_map<const SlotScope*, std::vector<std::pair<Expression**, Statement*>>> uses;
+
+	const auto collectUses = [&](const auto& self, Expression** slot, Expression* expression, Statement* owner) -> void {
+		if (!expression) return;
+		switch (expression->type) {
+		case AST_EXPRESSION_VARIABLE:
+			if (expression->variable->type == AST_VARIABLE_SLOT
+				&& expression->variable->slotScope
+				&& *expression->variable->slotScope) {
+				uses[*expression->variable->slotScope].emplace_back(slot, owner);
+			}
+			if (expression->variable->table) self(self, &expression->variable->table, expression->variable->table, owner);
+			if (expression->variable->tableIndex) self(self, &expression->variable->tableIndex, expression->variable->tableIndex, owner);
+			break;
+		case AST_EXPRESSION_FUNCTION_CALL:
+			if (expression->functionCall->function) self(self, &expression->functionCall->function, expression->functionCall->function, owner);
+			for (size_t j = 0; j < expression->functionCall->arguments.size(); j++) {
+				self(self, &expression->functionCall->arguments[j], expression->functionCall->arguments[j], owner);
+			}
+			if (expression->functionCall->multresArgument) {
+				self(self, &expression->functionCall->multresArgument, expression->functionCall->multresArgument, owner);
+			}
+			break;
+		case AST_EXPRESSION_TABLE:
+			for (auto& field : expression->table->fields) {
+				self(self, &field.key, field.key, owner);
+				self(self, &field.value, field.value, owner);
+			}
+			if (expression->table->multresField) self(self, &expression->table->multresField, expression->table->multresField, owner);
+			break;
+		case AST_EXPRESSION_BINARY_OPERATION:
+			self(self, &expression->binaryOperation->leftOperand, expression->binaryOperation->leftOperand, owner);
+			self(self, &expression->binaryOperation->rightOperand, expression->binaryOperation->rightOperand, owner);
+			break;
+		case AST_EXPRESSION_UNARY_OPERATION:
+			self(self, &expression->unaryOperation->operand, expression->unaryOperation->operand, owner);
+			break;
+		default:
+			break;
+		}
+	};
+
+	const auto walkStatementUses = [&](const auto& self, Statement* statement) -> void {
+		if (!statement) return;
+		for (size_t j = 0; j < statement->assignment.expressions.size(); j++) {
+			collectUses(collectUses, &statement->assignment.expressions[j], statement->assignment.expressions[j], statement);
+		}
+		if (statement->assignment.multresReturn) {
+			collectUses(collectUses, &statement->assignment.multresReturn, statement->assignment.multresReturn, statement);
+		}
+		if (statement->assignment.variables.size() == 1 && statement->assignment.variables.back().tableIndex) {
+			collectUses(collectUses, &statement->assignment.variables.back().tableIndex,
+				statement->assignment.variables.back().tableIndex, statement);
+		}
+		if (statement->assignment.variables.size() == 1 && statement->assignment.variables.back().table) {
+			collectUses(collectUses, &statement->assignment.variables.back().table,
+				statement->assignment.variables.back().table, statement);
+		}
+		for (Statement* child : statement->block) self(self, child);
+	};
+	{
+		const auto walkRoot = [&](const auto& self, std::vector<Statement*>& blk) -> void {
+			for (Statement* statement : blk) {
+				if (statement) {
+					walkStatementUses(walkStatementUses, statement);
+					if (!statement->block.empty()) self(self, statement->block);
+				}
+			}
+		};
+		walkRoot(walkRoot, function.block);
+	}
+
+	// 4) 对每个单写入者作用域做支配检查并传播。
+	const auto slotRefsInExpression = [&](const auto& self, std::unordered_set<uint8_t>& slots, const Expression* expression) -> void {
+		if (!expression) return;
+		switch (expression->type) {
+		case AST_EXPRESSION_VARIABLE:
+			if (expression->variable->type == AST_VARIABLE_SLOT) slots.insert(expression->variable->slot);
+			if (expression->variable->table) self(self, slots, expression->variable->table);
+			if (expression->variable->tableIndex) self(self, slots, expression->variable->tableIndex);
+			break;
+		case AST_EXPRESSION_FUNCTION_CALL:
+			self(self, slots, expression->functionCall->function);
+			for (const Expression* arg : expression->functionCall->arguments) self(self, slots, arg);
+			if (expression->functionCall->multresArgument) self(self, slots, expression->functionCall->multresArgument);
+			break;
+		case AST_EXPRESSION_TABLE:
+			for (const auto& field : expression->table->fields) {
+				self(self, slots, field.key);
+				self(self, slots, field.value);
+			}
+			if (expression->table->multresField) self(self, slots, expression->table->multresField);
+			break;
+		case AST_EXPRESSION_BINARY_OPERATION:
+			self(self, slots, expression->binaryOperation->leftOperand);
+			self(self, slots, expression->binaryOperation->rightOperand);
+			break;
+		case AST_EXPRESSION_UNARY_OPERATION:
+			self(self, slots, expression->unaryOperation->operand);
+			break;
+		default:
+			break;
+		}
+	};
+
+	for (const auto& [scope, writer] : writerStatement) {
+		if (multiWriter.contains(scope)) continue;
+		if (!writer || writer->instruction.label != INVALID_ID) continue;
+		if (writer->assignment.expressions.size() != 1 || !writer->assignment.expressions.back()) continue;
+
+		Expression* rhs = writer->assignment.expressions.back();
+		if (expression_references_scope(rhs, scope)) continue;
+
+		// RHS 若是槽位引用, 要求其作用域最终会被命名 (参数或存在写入语句),
+		// 否则内联会留下 `var_<槽位>` 兜底名。
+		if (rhs->type == AST_EXPRESSION_VARIABLE && rhs->variable->type == AST_VARIABLE_SLOT) {
+			SlotScope* rhsScope = *rhs->variable->slotScope;
+			const uint8_t rhsSlot = rhs->variable->slot;
+			const bool rhsIsParameter = rhsSlot < function.slotScopeCollector.slotInfos.size()
+				&& function.slotScopeCollector.slotInfos[rhsSlot].isParameter;
+			if (!rhsScope || (!rhsIsParameter && !writtenScopes.contains(rhsScope))) continue;
+		}
+
+		const bool impure = expression_has_side_effects(rhs);
+		std::unordered_set<uint8_t> rhsSlots;
+		slotRefsInExpression(slotRefsInExpression, rhsSlots, rhs);
+
+		auto useIt = uses.find(scope);
+		if (useIt == uses.end()) continue;
+		auto& scopeUses = useIt->second;
+
+		// 带副作用 RHS 只有在作用域仅一个使用点 (传播后可删除写入语句) 时才安全,
+		// 否则会把调用复制到多处。
+		if (impure && scopeUses.size() != 1) continue;
+
+		std::vector<Expression**> pendingReplacements;
+		bool safe = true;
+
+		for (const auto& [ref, useStatement] : scopeUses) {
+			if (!useStatement) { safe = false; break; }
+
+			// 块树支配: 写入者所在的块必须是使用点块路径上的祖先, 且写入者
+			// 在路径子语句之前; 路径上任何有效标签都允许跳入跳过写入者, 不安全。
+			bool dominated = false;
+			std::vector<Statement*>* writerBlock = ownerBlock[writer];
+			const size_t writerIndex = blockIndex[writer];
+			std::vector<Statement*>* useBlock = ownerBlock[useStatement];
+			Statement* pathChild = useStatement; // 路径上属于 writer 块的那个子语句
+
+			if (useBlock == writerBlock) {
+				if (writerIndex < blockIndex[useStatement]) {
+					dominated = true;
+					for (size_t j = writerIndex + 1; j < blockIndex[useStatement]; j++) {
+						if ((*writerBlock)[j] && function.is_valid_label((*writerBlock)[j]->instruction.label)) {
+							dominated = false;
+							break;
+						}
+					}
+				}
+			} else {
+				Statement* current = useStatement;
+				while (current && ownerBlock[current] != writerBlock) {
+					current = ownerStatement[current];
+				}
+				if (current && writerIndex < blockIndex[current]) {
+					dominated = true;
+					pathChild = current;
+					// writer 块中 writer 之后到 pathChild 之间不得有标签。
+					for (size_t j = writerIndex + 1; j < blockIndex[current]; j++) {
+						if ((*writerBlock)[j] && function.is_valid_label((*writerBlock)[j]->instruction.label)) {
+							dominated = false;
+							break;
+						}
+					}
+				}
+			}
+
+			if (!dominated || !(writer->instruction.id < useStatement->instruction.id)) {
+				safe = false;
+				break;
+			}
+			// 使用点自身是跳转目标时, 跳入会跳过写入者。
+			if (function.is_valid_label(useStatement->instruction.label)) {
+				safe = false;
+				break;
+			}
+
+			// 路径子语句链上不得有标签: 跳入会跳过写入者。
+			if (useBlock != writerBlock) {
+				Statement* pathStmt = ownerStatement[useStatement];
+				while (pathStmt && pathStmt != pathChild) {
+					if (function.is_valid_label(pathStmt->instruction.label)) { safe = false; break; }
+					pathStmt = ownerStatement[pathStmt];
+				}
+				if (safe && pathStmt == pathChild && function.is_valid_label(pathChild->instruction.label)) safe = false;
+			}
+			if (!safe) break;
+
+			// 无中间改写: 写入者与使用点之间, RHS 引用的任何槽位不得被重新赋值。
+			if (!rhsSlots.empty() && writer->instruction.id != INVALID_ID && useStatement->instruction.id != INVALID_ID) {
+				const uint32_t begin = writer->instruction.id;
+				const uint32_t end = useStatement->instruction.id;
+				for (const auto& [otherScope, otherWriter] : writerStatement) {
+					if (!otherWriter || otherWriter->instruction.id <= begin || otherWriter->instruction.id >= end) continue;
+					for (const Variable& variable : otherWriter->assignment.variables) {
+						if (variable.type == AST_VARIABLE_SLOT && rhsSlots.contains(variable.slot)) {
+							safe = false;
+							break;
+						}
+					}
+					if (!safe) break;
+				}
+			}
+			if (!safe) break;
+
+			pendingReplacements.emplace_back(ref);
+		}
+
+		if (!safe || pendingReplacements.empty()) continue;
+
+		// 传播: 替换所有使用点引用; 无剩余引用时删除写入语句。
+		for (Expression** ref : pendingReplacements) {
+			if (!*ref || (*ref)->type != AST_EXPRESSION_VARIABLE
+				|| (*ref)->variable->type != AST_VARIABLE_SLOT
+				|| !(*ref)->variable->slotScope) {
+				continue;
+			}
+			SlotScope* oldScope = *(*ref)->variable->slotScope;
+			if (oldScope) refCounts[oldScope]--;
+			*ref = rhs;
+		}
+
+		bool eraseWriter = false;
+		{
+			const auto countRefs = [&](const auto& self, const Statement* statement) -> uint32_t {
+				uint32_t count = 0;
+				const auto countExpr = [&](const auto& self2, const Expression* expression) -> void {
+					if (!expression) return;
+					switch (expression->type) {
+					case AST_EXPRESSION_VARIABLE:
+						if (expression->variable->type == AST_VARIABLE_SLOT
+							&& expression->variable->slotScope
+							&& *expression->variable->slotScope == scope)
+							count++;
+						if (expression->variable->table) self2(self2, expression->variable->table);
+						if (expression->variable->tableIndex) self2(self2, expression->variable->tableIndex);
+						break;
+					case AST_EXPRESSION_FUNCTION_CALL:
+						self2(self2, expression->functionCall->function);
+						for (const Expression* arg : expression->functionCall->arguments) self2(self2, arg);
+						if (expression->functionCall->multresArgument) self2(self2, expression->functionCall->multresArgument);
+						break;
+					case AST_EXPRESSION_TABLE:
+						for (const auto& field : expression->table->fields) {
+							self2(self2, field.key);
+							self2(self2, field.value);
+						}
+						if (expression->table->multresField) self2(self2, expression->table->multresField);
+						break;
+					case AST_EXPRESSION_BINARY_OPERATION:
+						self2(self2, expression->binaryOperation->leftOperand);
+						self2(self2, expression->binaryOperation->rightOperand);
+						break;
+					case AST_EXPRESSION_UNARY_OPERATION:
+						self2(self2, expression->unaryOperation->operand);
+						break;
+					default: break;
+					}
+				};
+				for (const Expression* expression : statement->assignment.expressions) countExpr(countExpr, expression);
+				if (statement->assignment.multresReturn) countExpr(countExpr, statement->assignment.multresReturn);
+				for (const Variable& variable : statement->assignment.variables) {
+					if (variable.table) countExpr(countExpr, variable.table);
+					if (variable.tableIndex) countExpr(countExpr, variable.tableIndex);
+				}
+				for (const Statement* child : statement->block) count += self(self, child);
+				return count;
+			};
+			uint32_t total = 0;
+			const auto walkRoot = [&](const auto& self, std::vector<Statement*>& block) -> void {
+				for (Statement* statement : block) {
+					if (statement) total += countRefs(countRefs, statement);
+				}
+			};
+			walkRoot(walkRoot, function.block);
+			eraseWriter = (total == 0);
+		}
+
+		if (eraseWriter && !capturedScopes.contains(scope)) {
+			erasedAny = true;
+			function.slotScopeCollector.remove_scope(writer->assignment.variables.back().slot, writer->assignment.variables.back().slotScope);
+			auto blockIt = ownerBlock[writer];
+			if (blockIt) {
+				size_t erasedIndex = blockIndex[writer];
+				auto& blk = *blockIt;
+				for (size_t j = 0; j < blk.size(); j++) {
+					if (blk[j] == writer) {
+						erasedIndex = j;
+						blk.erase(blk.begin() + j);
+						break;
+					}
+				}
+				// 同一块内后续语句的下标已偏移, 增量修正, 避免陈旧索引删错语句。
+				for (auto& [statement, index] : blockIndex) {
+					if (ownerBlock[statement] == blockIt && index > erasedIndex) index--;
+				}
+			}
+		}
+	}
+
+		return erasedAny;
+	};
+
+	while (onePass()) {}
+}
+
+static bool expression_same_variable(const Ast::Expression* a, const Ast::Expression* b) {
+	if (!a || !b || a->type != Ast::AST_EXPRESSION_VARIABLE || b->type != Ast::AST_EXPRESSION_VARIABLE) return false;
+	if (a->variable->type != b->variable->type) return false;
+
+	switch (a->variable->type) {
+	case Ast::AST_VARIABLE_SLOT:
+		return a->variable->slot == b->variable->slot && *a->variable->slotScope == *b->variable->slotScope;
+	case Ast::AST_VARIABLE_UPVALUE:
+		return a->variable->slotScope == b->variable->slotScope;
+	default:
+		break;
+	}
+
+	return false;
+}
+
+void Ast::restore_method_calls(Function& function, std::vector<Statement*>& block) {
+	for (uint32_t i = 0; i < block.size(); i++) {
+		Statement* statement = block[i];
+		if (!statement) continue;
+		if (!statement->block.empty()) restore_method_calls(function, statement->block);
+
+		FunctionCall* functionCall = nullptr;
+		if ((statement->type == AST_STATEMENT_FUNCTION_CALL
+				|| statement->type == AST_STATEMENT_ASSIGNMENT
+				|| statement->type == AST_STATEMENT_DECLARATION)
+			&& statement->assignment.expressions.size() == 1
+			&& statement->assignment.expressions.back()
+			&& statement->assignment.expressions.back()->type == AST_EXPRESSION_FUNCTION_CALL) {
+			functionCall = statement->assignment.expressions.back()->functionCall;
+		} else if (statement->type == AST_STATEMENT_RETURN
+			&& statement->assignment.multresReturn
+			&& statement->assignment.multresReturn->type == AST_EXPRESSION_FUNCTION_CALL) {
+			functionCall = statement->assignment.multresReturn->functionCall;
+		}
+
+		if (!functionCall || functionCall->isMethod || functionCall->arguments.empty()) continue;
+
+		// 模式: 函数位置是 `接收者.字段` (TGETS), 第一个参数就是接收者本身
+		// (方法调用的 self 副本), 还原为 `接收者:字段(...)`。
+		Expression* fn = functionCall->function;
+		if (!fn || fn->type != AST_EXPRESSION_VARIABLE || fn->variable->type != AST_VARIABLE_TABLE_INDEX) continue;
+		if (!fn->variable->tableIndex || fn->variable->tableIndex->type != AST_EXPRESSION_CONSTANT
+			|| !fn->variable->tableIndex->constant->isName)
+			continue;
+
+		Expression* receiver = fn->variable->table;
+		if (!receiver) continue;
+		const bool receiverIsVariable = receiver->type == AST_EXPRESSION_VARIABLE
+			&& (receiver->variable->type == AST_VARIABLE_SLOT || receiver->variable->type == AST_VARIABLE_UPVALUE);
+		const bool receiverIsTableIndex = receiver->type == AST_EXPRESSION_VARIABLE
+			&& receiver->variable->type == AST_VARIABLE_TABLE_INDEX;
+		if (!receiverIsVariable && !receiverIsTableIndex)
+			continue;
+		if (!expressions_equal(*functionCall->arguments.front(), *receiver)) continue;
+
+		bool ambiguous = false;
+		for (size_t j = 1; j < functionCall->arguments.size(); j++) {
+			if (expressions_equal(*functionCall->arguments[j], *receiver)) {
+				ambiguous = true;
+				break;
+			}
+		}
+		if (ambiguous) continue;
+
+		functionCall->isMethod = true;
+		functionCall->arguments.erase(functionCall->arguments.begin());
+
+		// 接收者若来自紧邻的单用途槽赋值 (UGET/GGET/TGETS 结果), 进一步内联,
+		// 消除 `local var = self.list; self.list:push(...)` 中的接收者临时变量。
+		if (!receiverIsVariable || receiver->variable->type != AST_VARIABLE_SLOT) continue;
+
+		SlotScope* receiverScope = *receiver->variable->slotScope;
+		if (!receiverScope) continue;
+		uint32_t writer = INVALID_ID;
+
+		for (uint32_t k = i, scanned = 0; k-- > 0 && scanned < 64;) {
+			scanned++;
+			Statement* previous = block[k];
+			if (previous->type == AST_STATEMENT_GOTO || previous->type == AST_STATEMENT_EMPTY) {
+				if (function.is_valid_label(previous->instruction.label)) break;
+				continue;
+			}
+			if ((previous->type == AST_STATEMENT_ASSIGNMENT
+					|| (previous->type == AST_STATEMENT_DECLARATION
+						&& (*previous->assignment.variables.back().slotScope)->isSynthetic))
+				&& previous->assignment.variables.size() == 1
+				&& previous->assignment.expressions.size() == 1
+				&& previous->assignment.variables.back().type == AST_VARIABLE_SLOT
+				&& previous->assignment.variables.back().slot == receiver->variable->slot
+				&& !function.is_valid_label(previous->instruction.label)
+				&& count_scope_reads_in_block(block, receiverScope) == 1) {
+				writer = k;
+				break;
+			}
+			break;
+		}
+
+		if (writer == INVALID_ID) continue;
+
+		Statement* writerStatement = block[writer];
+		Expression* rhs = writerStatement->assignment.expressions.back();
+		if (expression_references_scope(rhs, receiverScope)) continue;
+
+		fn->variable->table = rhs;
+		function.slotScopeCollector.remove_scope(writerStatement->assignment.variables.back().slot, writerStatement->assignment.variables.back().slotScope);
+		block.erase(block.begin() + writer);
+		i--;
 	}
 }
 
@@ -2708,6 +3459,16 @@ void Ast::build_multi_assignment(Function& function, std::vector<Statement*>& bl
 
 				for (uint8_t j = block[i]->assignment.variables.size(); j--;) {
 					function.slotScopeCollector.remove_scope(block[i]->assignment.variables[j].slot, block[i]->assignment.variables[j].slotScope);
+					// 把旧结果作用域重定向到新变量作用域: 折叠/内联产生的既有引用
+					// (如 `if file == nil` 的测试操作数) 仍指向旧作用域对象, 否则
+					// 会留下无名幽灵作用域, 写出阶段退化为 `var_<槽位>`。
+					SlotScope* oldResultScope = *block[i]->assignment.variables[j].slotScope;
+					SlotScope** newVariableScopePtr = block[i + 1]->assignment.variables.back().slotScope;
+					SlotScope* newVariableScope = newVariableScopePtr ? *newVariableScopePtr : nullptr;
+					if (oldResultScope && newVariableScope && oldResultScope != newVariableScope) {
+						oldResultScope->mergedScopes.emplace_back(&oldResultScope->slotScope);
+						oldResultScope->slotScope = newVariableScope;
+					}
 					block[i]->assignment.variables[j] = block[i + 1]->assignment.variables.back();
 					block.erase(block.begin() + i + 1);
 				}
@@ -3145,11 +3906,112 @@ void Ast::clean_up(Function& function) {
 	cleanup_unused_declarations(function, function.block);
 	fix_out_of_scope_declarations(function);
 
+	// 兜底: 任何残留的无名槽位作用域 (写入者被极端情况消除后仍有引用),
+	// 补名并确保函数头部存在声明, 避免写出未声明的 `var_<槽位>`。
+	std::unordered_map<SlotScope*, uint8_t> unnamedScopes;
+	{
+		const auto collectUnnamed = [&](const auto& self, const Expression* expression) -> void {
+			if (!expression) return;
+			switch (expression->type) {
+			case AST_EXPRESSION_VARIABLE:
+				if (expression->variable->type == AST_VARIABLE_SLOT
+					&& expression->variable->slotScope
+					&& *expression->variable->slotScope
+					&& (*expression->variable->slotScope)->name.empty()) {
+					unnamedScopes.try_emplace(*expression->variable->slotScope, expression->variable->slot);
+				}
+				if (expression->variable->table) self(self, expression->variable->table);
+				if (expression->variable->tableIndex) self(self, expression->variable->tableIndex);
+				break;
+			case AST_EXPRESSION_FUNCTION_CALL:
+				self(self, expression->functionCall->function);
+				for (const Expression* arg : expression->functionCall->arguments) self(self, arg);
+				if (expression->functionCall->multresArgument) self(self, expression->functionCall->multresArgument);
+				break;
+			case AST_EXPRESSION_TABLE:
+				for (const auto& field : expression->table->fields) {
+					self(self, field.key);
+					self(self, field.value);
+				}
+				if (expression->table->multresField) self(self, expression->table->multresField);
+				break;
+			case AST_EXPRESSION_BINARY_OPERATION:
+				self(self, expression->binaryOperation->leftOperand);
+				self(self, expression->binaryOperation->rightOperand);
+				break;
+			case AST_EXPRESSION_UNARY_OPERATION:
+				self(self, expression->unaryOperation->operand);
+				break;
+			default: break;
+			}
+		};
+		const auto walk = [&](const auto& self, const Statement* statement) -> void {
+			if (!statement) return;
+			for (const Expression* expr : statement->assignment.expressions) collectUnnamed(collectUnnamed, expr);
+			if (statement->assignment.multresReturn) collectUnnamed(collectUnnamed, statement->assignment.multresReturn);
+			for (const Variable& variable : statement->assignment.variables) {
+				collectUnnamed(collectUnnamed, variable.table);
+				collectUnnamed(collectUnnamed, variable.tableIndex);
+			}
+			for (const Statement* child : statement->block) self(self, child);
+		};
+		const auto walkRoot = [&](const auto& self, std::vector<Statement*>& block) -> void {
+			for (Statement* statement : block) {
+				if (statement) {
+					walk(walk, statement);
+					if (!statement->block.empty()) self(self, statement->block);
+				}
+			}
+		};
+		walkRoot(walkRoot, function.block);
+	}
+
+	if (!unnamedScopes.empty()) {
+		uint32_t counter = 9000;
+		std::unordered_set<SlotScope*> declaredScopes;
+		{
+			const auto collectDeclared = [&](const auto& self, const Statement* statement) -> void {
+				if (!statement) return;
+				for (const Variable& variable : statement->assignment.variables) {
+					if (variable.type == AST_VARIABLE_SLOT && variable.slotScope && *variable.slotScope) {
+						declaredScopes.insert(*variable.slotScope);
+					}
+				}
+				for (const Statement* child : statement->block) self(self, child);
+			};
+			const auto walkRoot = [&](const auto& self, std::vector<Statement*>& block) -> void {
+				for (Statement* statement : block) {
+					if (statement) {
+						collectDeclared(collectDeclared, statement);
+						if (!statement->block.empty()) self(self, statement->block);
+					}
+				}
+			};
+			walkRoot(walkRoot, function.block);
+		}
+
+		for (const auto& [scope, slot] : unnamedScopes) {
+			scope->name = "var_" + std::to_string(minimizeDiffs ? function.level : function.id)
+				+ "_" + std::to_string(counter++);
+			scope->isSynthetic = true;
+
+			if (declaredScopes.contains(scope)) continue;
+			Statement* declaration = new_statement(AST_STATEMENT_DECLARATION);
+			declaration->assignment.variables.emplace_back();
+			declaration->assignment.variables.back().type = AST_VARIABLE_SLOT;
+			declaration->assignment.variables.back().slot = slot;
+			declaration->assignment.variables.back().slotScope = scope->slotScope ? &scope->slotScope : nullptr;
+			function.block.insert(function.block.begin(), declaration);
+			declaredScopes.insert(scope);
+		}
+	}
+
 	for (uint32_t i = 0, labelCounter = 0; i < function.labels.size(); i++) {
 		if (!function.labels[i].jumpIds.size()) continue;
 		function.labels[i].name = "label_" + std::to_string(minimizeDiffs ? function.level : function.id) + "_" + std::to_string(labelCounter);
 		labelCounter++;
 	}
+
 }
 
 void Ast::fixup_labels(Function& function) {

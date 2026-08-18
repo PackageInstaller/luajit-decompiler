@@ -1,7 +1,10 @@
 #include "main.h"
 
 #include <algorithm>
+#include <atomic>
 #include <filesystem>
+#include <mutex>
+#include <thread>
 
 struct Error {
 	const std::string message;
@@ -11,8 +14,10 @@ struct Error {
 	const std::string line;
 };
 
-static bool isProgressBarActive = false;
-static uint32_t filesSkipped = 0;
+static std::atomic<bool> isProgressBarActive = false;
+static std::atomic<uint32_t> filesSkipped = 0;
+static bool parallelMode = false;
+static std::mutex printMutex;
 
 static struct {
 	bool showHelp = false;
@@ -21,6 +26,7 @@ static struct {
 	bool ignoreDebugInfo = false;
 	bool minimizeDiffs = false;
 	bool unrestrictedAscii = false;
+	uint32_t jobs = 0;
 	std::string inputPath;
 	std::string outputPath;
 	std::string extensionFilter;
@@ -56,7 +62,8 @@ static std::string output_name_for(const std::filesystem::path& file) {
 
 static bool decompile_file(
 	const std::filesystem::path& inputFile,
-	const std::filesystem::path& outputFile
+	const std::filesystem::path& outputFile,
+	std::vector<std::string>& lines
 ) {
 	try {
 		Bytecode bytecode(inputFile.string());
@@ -67,27 +74,27 @@ static bool decompile_file(
 			arguments.unrestrictedAscii
 		);
 
-		print("--------------------\nInput file: " + inputFile.string() + "\nReading bytecode...");
+		lines.emplace_back("--------------------\nInput file: " + inputFile.string() + "\nReading bytecode...");
 		bytecode();
-		print("Building ast...");
+		lines.emplace_back("Building ast...");
 		ast();
-		print("Writing lua source...");
+		lines.emplace_back("Writing lua source...");
 		lua();
-		print("Output file: " + outputFile.string());
+		lines.emplace_back("Output file: " + outputFile.string());
 	} catch (const Error& error) {
 		erase_progress_bar();
 
 		if (arguments.silentAssertions) {
-			print("\nError running " + error.function + "\nSource: " + error.source + ":" + error.line + "\n\n" + error.message);
+			lines.emplace_back("\nError running " + error.function + "\nSource: " + error.source + ":" + error.line + "\n\n" + error.message);
 		} else {
-			print("\nError running " + error.function + "\nSource: " + error.source + ":" + error.line
+			lines.emplace_back("\nError running " + error.function + "\nSource: " + error.source + ":" + error.line
 				+ "\n\nFile: " + error.filePath + "\n\n" + error.message);
 		}
 
 		filesSkipped++;
 		return false;
 	} catch (...) {
-		print("Unknown exception\n\nFile: " + inputFile.string());
+		lines.emplace_back("Unknown exception\n\nFile: " + inputFile.string());
 		throw;
 	}
 
@@ -129,6 +136,12 @@ static char* parse_arguments(const int& argc, char* const* argv) {
 				} else if (argument == "ignore_debug_info") {
 					arguments.ignoreDebugInfo = true;
 					continue;
+				} else if (argument == "jobs") {
+					if (i <= argc - 2) {
+						i++;
+						arguments.jobs = std::strtoul(argv[i], nullptr, 10);
+						continue;
+					}
 				} else if (argument == "minimize_diffs") {
 					arguments.minimizeDiffs = true;
 					continue;
@@ -161,6 +174,11 @@ static char* parse_arguments(const int& argc, char* const* argv) {
 					continue;
 				case 'i':
 					arguments.ignoreDebugInfo = true;
+					continue;
+				case 'j':
+					if (i > argc - 2) break;
+					i++;
+					arguments.jobs = std::strtoul(argv[i], nullptr, 10);
 					continue;
 				case 'm':
 					arguments.minimizeDiffs = true;
@@ -207,6 +225,7 @@ int main(int argc, char* argv[]) {
 			"  -f, --force_overwrite\t\tAlways overwrite existing files\n"
 			"  -i, --ignore_debug_info\tIgnore bytecode debug info\n"
 			"  -m, --minimize_diffs\t\tOptimize output formatting to help minimize diffs\n"
+			"  -j, --jobs N\t\t\tNumber of worker threads (default: hardware concurrency)\n"
 			"  -u, --unrestricted_ascii\tDisable default UTF-8 encoding and string restrictions"
 		);
 		return EXIT_SUCCESS;
@@ -275,6 +294,16 @@ int main(int argc, char* argv[]) {
 
 	std::sort(inputs.begin(), inputs.end());
 
+	if (!arguments.jobs) {
+		arguments.jobs = std::thread::hardware_concurrency();
+		if (!arguments.jobs) arguments.jobs = 1;
+	}
+	parallelMode = arguments.jobs > 1;
+
+	// 任务列表: 输入/输出路径对, 目录一次性建好, 避免并发 create_directories 竞争。
+	std::vector<std::pair<std::filesystem::path, std::filesystem::path>> tasks;
+	tasks.reserve(inputs.size());
+
 	for (const auto& inputFile : inputs) {
 		const std::filesystem::path relativePath = std::filesystem::relative(inputFile, inputRoot);
 		const std::filesystem::path outputFile = outputDir
@@ -282,22 +311,60 @@ int main(int argc, char* argv[]) {
 			/ output_name_for(relativePath);
 
 		std::filesystem::create_directories(outputFile.parent_path());
-		decompile_file(inputFile, outputFile);
+		tasks.emplace_back(inputFile, outputFile);
+	}
+
+	// 现代 C++ 线程池: std::jthread + 原子任务游标。任务互相独立, 无队列锁竞争。
+	std::atomic<size_t> nextIndex = 0;
+	std::mutex linesMutex;
+	std::unordered_map<size_t, std::vector<std::string>> outputLines;
+
+	const auto worker = [&]() {
+		while (true) {
+			const size_t index = nextIndex.fetch_add(1);
+			if (index >= tasks.size()) break;
+
+			std::vector<std::string> lines;
+			decompile_file(tasks[index].first, tasks[index].second, lines);
+
+			if (parallelMode) {
+				std::lock_guard lock(linesMutex);
+				outputLines[index] = std::move(lines);
+			} else {
+				// 串行模式保持实时输出, 与旧行为一致。
+				for (const auto& line : lines) print(line);
+			}
+		}
+	};
+
+	std::vector<std::jthread> workers;
+	workers.reserve(arguments.jobs > 1 ? arguments.jobs - 1 : 0);
+	for (uint32_t i = 1; i < arguments.jobs; i++) workers.emplace_back(worker);
+	worker();
+	for (auto& workerThread : workers) workerThread.join();
+
+	// 并行模式按输入顺序回放日志, 保证输出确定、可读。
+	if (parallelMode) {
+		for (const auto& [index, lines] : outputLines) {
+			for (const auto& line : lines) print(line);
+		}
 	}
 
 	print("--------------------\n"
-		+ (filesSkipped ? "Failed to decompile " + std::to_string(filesSkipped) + " file" + (filesSkipped > 1 ? "s" : "") + ".\n" : "")
+		+ (filesSkipped.load() ? "Failed to decompile " + std::to_string(filesSkipped.load()) + " file" + (filesSkipped.load() > 1 ? "s" : "") + ".\n" : "")
 		+ "Done!");
 
 	return EXIT_SUCCESS;
 }
 
 void print(const std::string& message) {
+	std::lock_guard lock(printMutex);
 	std::fprintf(stdout, "%s\n", message.c_str());
 	std::fflush(stdout);
 }
 
 void print_progress_bar(const double& progress, const double& total) {
+	if (parallelMode) return;
 	static char PROGRESS_BAR[] = "\r[====================]";
 
 	const uint8_t threshold = std::round(20 / total * progress);
@@ -311,9 +378,10 @@ void print_progress_bar(const double& progress, const double& total) {
 }
 
 void erase_progress_bar() {
+	if (parallelMode) return;
 	static constexpr char PROGRESS_BAR_ERASER[] = "\r                      \r";
 
-	if (!isProgressBarActive) return;
+	if (!isProgressBarActive.load()) return;
 	std::fprintf(stderr, "%s", PROGRESS_BAR_ERASER);
 	isProgressBarActive = false;
 }

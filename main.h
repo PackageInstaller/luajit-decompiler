@@ -25,6 +25,7 @@
 #include <fstream>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #define DEBUG_INFO __FUNCTION__, __FILE__, __LINE__

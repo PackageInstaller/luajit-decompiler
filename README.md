@@ -6,6 +6,55 @@ LuaJIT 字节码反编译器。本仓库基于
 
 ## 版本变更
 
+### v2.0.7  多线程与临时变量削减
+
+**多线程并行反编译**
+
+- 新增 `-j, --jobs N` 选项，默认使用 `std::thread::hardware_concurrency()`；
+- 采用现代 C++ 线程池：`std::jthread` + `std::atomic<size_t>` 原子任务游标
+  分发独立文件任务，无队列锁竞争；
+- 并行模式下进度条自动关闭，日志按输入顺序回放，输出确定可读；
+- 串行模式（`-j 1`）保持实时日志输出，行为与旧版一致；
+- CMake 通过 `find_package(Threads)` 链接线程库。
+
+**临时变量（var_x）数量削减**
+
+- 广义临时槽消除：使用点前连续的单用途槽赋值链整体内联，
+  例如 `local f = table.insert; local t = x; f(t, ...)` 直接还原为
+  `table.insert(x, ...)`，支持跨多条赋值与多返回值调用；
+- 通用方法调用还原：`self.list.pushnode(self.list, node)` 还原为
+  `self.list:pushnode(node)`，并内联接收者临时槽；
+- 修复合并作用域误删：引用计数表在消除时同步递减，写入语句仅在无剩余
+  引用时删除，杜绝输出未声明的 `var_<槽位>` 兜底名（全语料库从
+  34503 处降到 0）；
+- 修复 `build_multi_assignment` 合并后旧作用域未重定向导致的幽灵引用，
+  例如 `file, err = io.open(...); if file == nil` 正确还原；
+- 保留表构造器合并级联：config 大表仍输出为单个表构造器，不产生
+  逐项临时变量。
+
+**跨块拷贝传播**
+
+- 新增 `propagate_cross_block_copies`：编译器为方法调用/表达式生成的临时槽
+  常横跨 goto/label 重构出的多个块（如 `local var = self.list` 在 if 分支、
+  使用在合并后的块），单趟链消除的连续窗口够不到。新 pass 用块树支配 +
+  路径标签检查 + 无中间改写检查做保守传播，将单写入者临时槽的值替换到
+  支配使用点，并在无剩余引用时删除写入语句；
+- 以函数级固定点迭代处理内联引入的新引用，避免顺序依赖留下幽灵槽；
+- 子函数（闭包）upvalue 捕获的作用域不删除写入者；多返回值 CALL 的结果槽
+  不参与传播（交给 `build_multi_assignment` 合并）；
+- 兜底防护：任何残留的无名槽位作用域自动补名并在函数头部补声明，
+  全语料库 `var_<槽位>` 兜底名为 0。
+
+**Frida 运行时分析**
+
+- `frida/ljd_analyze.js`：hook `luaL_loadbuffer(x)/luaL_loadstring/lua_loadx`
+  等入口，记录运行时加载的每个 Lua chunk（名字/长度/文件头），并按需把
+  字节码原样写入应用 files 目录，可直接喂给本反编译器；
+- Frida 16 下 `libtolua.so` 通常晚于脚本注入映射，脚本轮询等待模块，
+  并 hook `android_dlopen_ext/dlopen` 兜底；
+- `adb shell su -c 'tar -cf - -C <dump目录> .' > dumps.tar` 可绕过应用私有
+  目录权限直接取回 dump。
+
 ### v2.0  Linux 原生移植
 
 上游为 Win32 / MSVC / C++20 项目，依赖 Windows API。本版改为可跨平台编译的

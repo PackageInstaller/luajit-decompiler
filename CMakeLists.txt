@@ -6,6 +6,8 @@ project(luajit-decompiler-v2
 	LANGUAGES CXX
 )
 
+find_package(Threads REQUIRED)
+
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
@@ -25,6 +27,7 @@ add_executable(luajit-decompiler-v2
 	ast/ast.cpp
 	lua/lua.cpp
 )
+target_link_libraries(luajit-decompiler-v2 PRIVATE Threads::Threads)
 
 target_compile_definitions(luajit-decompiler-v2 PRIVATE _CHAR_UNSIGNED)
 
