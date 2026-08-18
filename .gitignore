@@ -8,6 +8,9 @@ build/
 build-asan/
 output/
 
+# 调试/运行时分析脚本与产物, 不进入版本库
+frida/
+
 # User-specific files
 *.rsuser
 *.suo
