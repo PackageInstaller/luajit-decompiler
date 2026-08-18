@@ -940,9 +940,12 @@ void Ast::cleanup_unused_declarations(Function& function, std::vector<Statement*
 				self(self, f.key);
 				self(self, f.value);
 			}
+			if (expr->table->multresField) self(self, expr->table->multresField);
 			break;
 		case AST_EXPRESSION_FUNCTION_CALL:
+			self(self, expr->functionCall->function);
 			for (Expression* arg : expr->functionCall->arguments) self(self, arg);
+			if (expr->functionCall->multresArgument) self(self, expr->functionCall->multresArgument);
 			break;
 		case AST_EXPRESSION_UNARY_OPERATION:
 			self(self, expr->unaryOperation->operand);
@@ -1322,13 +1325,17 @@ void Ast::clean_up_block(Function& function, std::vector<Statement*>& block, uin
 				&& !block[i]->assignment.expressions.back()->table->constants.list.size()
 				&& !block[i]->assignment.expressions.back()->table->constants.fields.size()
 				&& !block[i]->assignment.expressions.back()->table->multresField) {
-				function.slotScopeCollector.remove_scope(block[i]->assignment.variables.back().slot, block[i]->assignment.variables.back().slotScope);
-				block[i]->assignment.variables.back().type = AST_VARIABLE_TABLE_INDEX;
-				block[i]->assignment.variables.back().table = block[i]->assignment.expressions.back();
-				block[i]->assignment.variables.back().tableIndex = block[i]->assignment.expressions.back()->table->fields.back().key;
-				block[i]->assignment.expressions.back() = block[i]->assignment.expressions.back()->table->fields.back().value;
-				block[i]->assignment.variables.back().table->table->fields.pop_back();
-				continue;
+				std::unordered_set<const SlotScope*> capturedScopes;
+				collect_captured_scopes(function, capturedScopes);
+				if (!capturedScopes.contains(*block[i]->assignment.variables.back().slotScope)) {
+					function.slotScopeCollector.remove_scope(block[i]->assignment.variables.back().slot, block[i]->assignment.variables.back().slotScope);
+					block[i]->assignment.variables.back().type = AST_VARIABLE_TABLE_INDEX;
+					block[i]->assignment.variables.back().table = block[i]->assignment.expressions.back();
+					block[i]->assignment.variables.back().tableIndex = block[i]->assignment.expressions.back()->table->fields.back().key;
+					block[i]->assignment.expressions.back() = block[i]->assignment.expressions.back()->table->fields.back().value;
+					block[i]->assignment.variables.back().table->table->fields.pop_back();
+					continue;
+				}
 			}
 
 			for (uint32_t j = 0; j < block[i]->assignment.variables.size(); j++) {

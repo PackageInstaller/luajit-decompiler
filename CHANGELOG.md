@@ -4,6 +4,17 @@
 [marsinator358/luajit-decompiler-v2](https://github.com/marsinator358/luajit-decompiler-v2)
 维护。条目按版本从新到旧排列。
 
+### v2.0.10  表/闭包身份与方法 self
+
+- 表构造器和函数表达式不再按“无副作用”复制到多个使用点：
+  `local t = {}; t[k] = v; foo(t)` 以及 `setmetatable(t, t)` 会保留同一个局部表,
+  不再写成 `;({})[k] = v` / `setmetatable({}, {})`；
+- 闭包 upvalue 计入引用, 局部递归函数不再被收成 IIFE 后留下 `var_0(...)`；
+- FR2 方法调用里从未写入的 self 空洞不再被邻近同槽变量填入,
+  `obj.Find(<hole>, "path")` 还原为 `obj:Find("path")`；
+- 清理未使用声明时会统计函数位置的引用, 避免把多次调用的
+  `local function choose(...)` 当成死代码删掉。
+
 ### v2.0.9  支配树空转修复
 
 - Lengauer-Tarjan 的 DFS 编号不再用 0 表示“未访问”（入口指令 id 也是 0）。

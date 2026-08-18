@@ -56,7 +56,7 @@ private:
 	void build_expressions(Function& function, std::vector<Statement*>& block);
 	void build_slot_scopes(Function& function, std::vector<Statement*>& block, BlockInfo* const& previousBlock);
 	void eliminate_slots(Function& function, std::vector<Statement*>& block, BlockInfo* const& previousBlock);
-	void eliminate_slots(Function& function, std::vector<Statement*>& block, BlockInfo* const& previousBlock, std::unordered_map<const SlotScope*, uint32_t>& refCounts, std::unordered_set<const SlotScope*>& writtenScopes);
+	void eliminate_slots(Function& function, std::vector<Statement*>& block, BlockInfo* const& previousBlock, std::unordered_map<const SlotScope*, uint32_t>& refCounts, std::unordered_set<const SlotScope*>& writtenScopes, const std::unordered_set<const SlotScope*>& capturedScopes);
 	void propagate_cross_block_copies(Function& function);
 	bool restore_method_calls(Function& function, std::vector<Statement*>& block);
 	void eliminate_conditions(Function& function, std::vector<Statement*>& block, BlockInfo* const& previousBlock);

@@ -7,6 +7,7 @@
 bool expression_references_scope(const Ast::Expression* expression, const Ast::SlotScope* scope);
 bool expression_references_slot(const Ast::Expression* expression, uint8_t slot);
 bool expression_has_side_effects(const Ast::Expression* expression);
+bool expression_is_copy_safe(const Ast::Expression* expression);
 uint32_t count_scope_reads_in_block(const std::vector<Ast::Statement*>& block, const Ast::SlotScope* scope);
 void collect_scope_reads(const Ast::Function& function, std::unordered_map<const Ast::SlotScope*, uint32_t>& refCounts);
 void collect_written_scopes(const Ast::Function& function, std::unordered_set<const Ast::SlotScope*>& writtenScopes);

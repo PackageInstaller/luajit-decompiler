@@ -11,10 +11,15 @@ void Ast::eliminate_slots(Function& function, std::vector<Statement*>& block, Bl
 	collect_scope_reads(function, refCounts);
 	std::unordered_set<const SlotScope*> writtenScopes;
 	collect_written_scopes(function, writtenScopes);
-	eliminate_slots(function, block, previousBlock, refCounts, writtenScopes);
+	std::unordered_set<const SlotScope*> capturedScopes;
+	collect_captured_scopes(function, capturedScopes);
+	// 闭包 upvalue 不出现在当前函数的表达式树里, 视作额外引用,
+	// 避免把 `local t = {}` / 递归函数当成单用途临时槽内联掉。
+	for (const SlotScope* scope : capturedScopes) refCounts[scope]++;
+	eliminate_slots(function, block, previousBlock, refCounts, writtenScopes, capturedScopes);
 }
 
-void Ast::eliminate_slots(Function& function, std::vector<Statement*>& block, BlockInfo* const& previousBlock, std::unordered_map<const SlotScope*, uint32_t>& refCounts, std::unordered_set<const SlotScope*>& writtenScopes) {
+void Ast::eliminate_slots(Function& function, std::vector<Statement*>& block, BlockInfo* const& previousBlock, std::unordered_map<const SlotScope*, uint32_t>& refCounts, std::unordered_set<const SlotScope*>& writtenScopes, const std::unordered_set<const SlotScope*>& capturedScopes) {
 	BlockInfo blockInfo = { .block = block, .previousBlock = previousBlock };
 	Expression* expression;
 	uint32_t index, targetIndex, targetLabel, extendedTargetLabel;
@@ -260,6 +265,11 @@ void Ast::eliminate_slots(Function& function, std::vector<Statement*>& block, Bl
 					}
 					if (unsafe) continue;
 
+					// 递归局部函数捕获自己的赋值槽, 内联成 IIFE 会丢掉名字, 写出 `var_0(...)`。
+					if (rhs->type == AST_EXPRESSION_FUNCTION && rhs->function
+						&& rhs->function->assignmentSlotIsUpvalue)
+						continue;
+
 					// 函数位置的常量类型限制 (沿用原逻辑)。
 					bool isFunctionPosition = false;
 					for (Expression** openSlot : openSlotIt->second) {
@@ -286,10 +296,11 @@ void Ast::eliminate_slots(Function& function, std::vector<Statement*>& block, Bl
 					}
 
 					// 只有写入语句会被删除 (无剩余引用/初始化合并) 时才允许内联
-					// 带副作用的 RHS; 否则多用途临时槽的内联会把调用复制到使用点,
-					// 导致重复执行。
-					const bool willEraseWriter = mergeIntoDeclaration || refCounts[slotScope] == 1;
-					if (!willEraseWriter && expression_has_side_effects(rhs)) continue;
+					// 带副作用或有身份的 RHS; 否则多用途临时槽的内联会把
+					// 表构造器/闭包复制到使用点, 变成互不相干的 `{}`。
+					const bool willEraseWriter = mergeIntoDeclaration
+						|| (refCounts[slotScope] == 1 && !capturedScopes.contains(slotScope));
+					if (!willEraseWriter && !expression_is_copy_safe(rhs)) continue;
 
 					for (Expression** openSlot : openSlotIt->second) {
 						// 递减的是开放槽实际引用的作用域计数 (可能与写入语句作用域不同)。
@@ -328,12 +339,12 @@ void Ast::eliminate_slots(Function& function, std::vector<Statement*>& block, Bl
 		switch (block[i]->type) {
 		case AST_STATEMENT_NUMERIC_FOR:
 		case AST_STATEMENT_GENERIC_FOR:
-			eliminate_slots(function, block[i]->block, nullptr, refCounts, writtenScopes);
+			eliminate_slots(function, block[i]->block, nullptr, refCounts, writtenScopes, capturedScopes);
 			break;
 		case AST_STATEMENT_LOOP:
 		case AST_STATEMENT_DECLARATION:
 			blockInfo.index = i;
-			eliminate_slots(function, block[i]->block, &blockInfo, refCounts, writtenScopes);
+			eliminate_slots(function, block[i]->block, &blockInfo, refCounts, writtenScopes, capturedScopes);
 			break;
 		case AST_STATEMENT_ASSIGNMENT:
 			if (block[i]->assignment.variables.size() == 1) {
@@ -674,7 +685,10 @@ void Ast::eliminate_slots(Function& function, std::vector<Statement*>& block, Bl
 							break;
 						}
 
-						if (!block[i]->assignment.variables.back().isMultres && (*block[i - 1]->assignment.variables.back().slotScope)->usages == 1) {
+						if (!block[i]->assignment.variables.back().isMultres
+							&& (*block[i - 1]->assignment.variables.back().slotScope)->usages == 1
+							&& !capturedScopes.contains(*block[i - 1]->assignment.variables.back().slotScope)
+							&& refCounts[*block[i - 1]->assignment.variables.back().slotScope] <= 1) {
 							if (SlotScope* tableScope = *block[i]->assignment.variables.back().table->variable->slotScope) refCounts[tableScope]--;
 							block[i]->assignment.variables.back().table = block[i - 1]->assignment.expressions.back();
 							function.slotScopeCollector.remove_scope(block[i - 1]->assignment.variables.back().slot, block[i - 1]->assignment.variables.back().slotScope);
@@ -790,6 +804,30 @@ bool expression_has_side_effects(const Ast::Expression* expression) {
 	}
 
 	return false;
+}
+
+bool expression_is_copy_safe(const Ast::Expression* expression) {
+	if (!expression) return true;
+
+	switch (expression->type) {
+	case Ast::AST_EXPRESSION_FUNCTION_CALL:
+	case Ast::AST_EXPRESSION_VARARG:
+	case Ast::AST_EXPRESSION_TABLE:
+	case Ast::AST_EXPRESSION_FUNCTION:
+		return false;
+	case Ast::AST_EXPRESSION_VARIABLE:
+		return expression_is_copy_safe(expression->variable->table)
+			&& expression_is_copy_safe(expression->variable->tableIndex);
+	case Ast::AST_EXPRESSION_BINARY_OPERATION:
+		return expression_is_copy_safe(expression->binaryOperation->leftOperand)
+			&& expression_is_copy_safe(expression->binaryOperation->rightOperand);
+	case Ast::AST_EXPRESSION_UNARY_OPERATION:
+		return expression_is_copy_safe(expression->unaryOperation->operand);
+	default:
+		break;
+	}
+
+	return true;
 }
 
 uint32_t count_scope_reads_in_block(const std::vector<Ast::Statement*>& block, const Ast::SlotScope* scope) {
@@ -1367,6 +1405,7 @@ void Ast::propagate_cross_block_copies(Function& function) {
 		}
 
 		const bool impure = expression_has_side_effects(rhs);
+		const bool copySafe = expression_is_copy_safe(rhs);
 		std::unordered_set<uint8_t> rhsSlots;
 		slotRefsInExpression(slotRefsInExpression, rhsSlots, rhs);
 
@@ -1388,8 +1427,11 @@ void Ast::propagate_cross_block_copies(Function& function) {
 		if (!useList) continue;
 		auto& scopeUses = *useList;
 
-		// 带副作用 RHS 只有在作用域仅一个使用点 (传播后可删除写入语句) 时才安全,
-		// 否则会把调用复制到多处。
+		// 带副作用或有对象身份的 RHS 只有在作用域仅一个使用点 (传播后可删除写入语句)
+		// 且未被闭包捕获时才安全, 否则会把 `{}` / 函数复制成互不相干的新对象。
+		if (!copySafe && (scopeUses.size() != 1 || capturedScopes.contains(scope))) {
+			continue;
+		}
 		if (impure && scopeUses.size() != 1) {
 			continue;
 		}
@@ -1399,6 +1441,17 @@ void Ast::propagate_cross_block_copies(Function& function) {
 
 		for (const auto& [ref, useStatement] : scopeUses) {
 			if (!useStatement) { safe = false; break; }
+
+			// 槽位兜底时不要填从未被写入的开放槽 (FR2 方法调用的 self 空洞),
+			// 否则会把邻近同槽号变量灌进去, 变成 `obj.Find(var_x, "path")`。
+			if (slotFallback && ref && *ref && (*ref)->type == AST_EXPRESSION_VARIABLE
+				&& (*ref)->variable->type == AST_VARIABLE_SLOT
+				&& (*ref)->variable->slotScope && *(*ref)->variable->slotScope
+				&& *(*ref)->variable->slotScope != scope
+				&& !writtenScopes.contains(*(*ref)->variable->slotScope)
+				&& writerStatement.find(*(*ref)->variable->slotScope) == writerStatement.end()) {
+				continue;
+			}
 	
 			// CFG 支配: 写入指令必须支配使用指令, 即从函数入口到使用点的
 			// 所有路径都经过写入者。这正确处理了 if 分支 + goto 合并点:
@@ -1579,6 +1632,8 @@ void Ast::propagate_cross_block_copies(Function& function) {
 				continue;
 
 			Expression* rhs = writer->assignment.expressions.back();
+			if (!expression_is_copy_safe(rhs)) continue;
+			if (capturedScopes.contains(writerScope)) continue;
 			std::unordered_set<uint8_t> rhsSlots;
 			slotRefsInExpression(slotRefsInExpression, rhsSlots, rhs);
 
@@ -1587,6 +1642,15 @@ void Ast::propagate_cross_block_copies(Function& function) {
 
 			for (const auto& [ref, useStatement] : slotUses) {
 				if (!useStatement) { safe = false; break; }
+
+				if (ref && *ref && (*ref)->type == AST_EXPRESSION_VARIABLE
+					&& (*ref)->variable->type == AST_VARIABLE_SLOT
+					&& (*ref)->variable->slotScope && *(*ref)->variable->slotScope
+					&& *(*ref)->variable->slotScope != writerScope
+					&& !writtenScopes.contains(*(*ref)->variable->slotScope)
+					&& writerStatement.find(*(*ref)->variable->slotScope) == writerStatement.end()) {
+					continue;
+				}
 
 				// 支配: CFG (真实指令 id) 或块内位置 (无 id 声明)。
 				bool dominated = false;
@@ -1766,6 +1830,8 @@ bool Ast::restore_method_calls(Function& function, std::vector<Statement*>& bloc
 	std::unordered_set<const SlotScope*> consumedCopyScopes;
 	std::unordered_set<const SlotScope*> capturedScopes;
 	collect_captured_scopes(function, capturedScopes);
+	std::unordered_set<const SlotScope*> writtenScopes;
+	collect_written_scopes(function, writtenScopes);
 
 	const auto collectCopies = [&](const auto& self, std::vector<Statement*>& blk) -> void {
 		for (uint32_t i = 0; i < blk.size(); i++) {
@@ -1808,6 +1874,19 @@ bool Ast::restore_method_calls(Function& function, std::vector<Statement*>& bloc
 
 	// 模式: 函数位置是 `接收者.字段` (TGETS), 第一个参数就是接收者本身
 	// (或编译器为方法调用插入的 MOV 副本), 还原为 `接收者:字段(...)`。
+	const auto isUnwrittenSlot = [&](const Expression* arg) -> bool {
+		if (!arg || arg->type != AST_EXPRESSION_VARIABLE || arg->variable->type != AST_VARIABLE_SLOT)
+			return false;
+		const uint8_t slot = arg->variable->slot;
+		if (slot < function.slotScopeCollector.slotInfos.size()
+			&& function.slotScopeCollector.slotInfos[slot].isParameter)
+			return false;
+		if (!arg->variable->slotScope || !*arg->variable->slotScope) return true;
+		const SlotScope* scope = *arg->variable->slotScope;
+		if (copiesByScope.contains(scope)) return false;
+		return !writtenScopes.contains(scope);
+	};
+
 	const auto tryRestore = [&](FunctionCall* functionCall) -> bool {
 		if (!functionCall || functionCall->isMethod || functionCall->arguments.empty()) return false;
 		Expression* fn = functionCall->function;
@@ -1818,6 +1897,26 @@ bool Ast::restore_method_calls(Function& function, std::vector<Statement*>& bloc
 
 		Expression* receiver = fn->variable->table;
 		if (!receiver) return false;
+
+		// FR2 下方法调用的 self 槽若未被写入, 第一个实参是空洞。
+		// 丢掉后再按冒号调用还原: `obj.Find(<hole>, "path")` → `obj:Find("path")`。
+		if (isUnwrittenSlot(functionCall->arguments.front())) {
+			bool laterSelf = false;
+			for (size_t j = 1; j < functionCall->arguments.size(); j++) {
+				if (argMatchesReceiver(functionCall->arguments[j], receiver)) {
+					laterSelf = true;
+					break;
+				}
+			}
+			if (!laterSelf) {
+				functionCall->arguments.erase(functionCall->arguments.begin());
+				functionCall->isMethod = true;
+				return true;
+			}
+			functionCall->arguments.erase(functionCall->arguments.begin());
+			if (functionCall->arguments.empty()) return false;
+		}
+
 		if (!argMatchesReceiver(functionCall->arguments.front(), receiver)) return false;
 
 		for (size_t j = 1; j < functionCall->arguments.size(); j++) {
