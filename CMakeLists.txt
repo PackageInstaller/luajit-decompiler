@@ -25,6 +25,9 @@ add_executable(luajit-decompiler-v2
 	bytecode/bytecode.cpp
 	bytecode/prototype.cpp
 	ast/ast.cpp
+	ast/eliminate.cpp
+	ast/condition.cpp
+	ast/cleanup.cpp
 	lua/lua.cpp
 )
 target_link_libraries(luajit-decompiler-v2 PRIVATE Threads::Threads)
