@@ -79,7 +79,8 @@ struct Expression {
 		}
 	}
 
-	AST_EXPRESSION type;
+	// 默认值防止构造函数 set_type() 先 delete_type() 时读到未初始化枚举 (UBSan)。
+	AST_EXPRESSION type = AST_EXPRESSION_CONSTANT;
 
 	union {
 		Constant* constant = nullptr;

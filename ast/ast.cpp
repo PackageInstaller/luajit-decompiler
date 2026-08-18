@@ -68,9 +68,13 @@ void Ast::build_functions(Function& function, uint32_t& functionCounter) {
 	}
 	assert(function.slotScopeCollector.assert_scopes_closed(), "Failed to close slot scopes", bytecode.filePath, DEBUG_INFO);
 	eliminate_slots(function, function.block, nullptr);
-	propagate_cross_block_copies(function);
 	restore_method_calls(function, function.block);
 	eliminate_conditions(function, function.block, nullptr);
+	// build_multi_assignment 在 eliminate_conditions 末尾执行: 传播放在其后,
+	// 避免删除多返回值合并窗口内的语句破坏其位置索引。
+	propagate_cross_block_copies(function);
+	// 传播内联接收者后, 再跑一次方法还原, 把新内联的接收者转成 `obj:method()`。
+	restore_method_calls(function, function.block);
 	build_if_statements(function, function.block, nullptr);
 	clean_up(function);
 	fixup_labels(function);
@@ -2443,56 +2447,229 @@ static void collect_written_scopes(const Ast::Function& function, std::unordered
 	for (const Ast::Statement* statement : function.block) walkStatement(walkStatement, statement);
 }
 
+// 基于原始字节码指令构建 CFG, 用 Lengauer-Tarjan 计算支配树
+// (O(n α(n)) 时间 / O(n) 内存, 大函数 (数万条指令) 也安全)。
+// 返回 idom[指令id]: 该指令的直接支配者指令 id (入口支配自己)。
+// 支配关系是跨分支/goto 传播的安全依据: 写入指令支配使用指令时,
+// 从函数入口到使用点的所有路径都必然经过写入者。
+static std::vector<uint32_t> compute_cfg_idom(const Bytecode::Prototype& prototype) {
+	const size_t n = prototype.instructions.size();
+	if (!n) return std::vector<uint32_t>();
+
+	std::vector<std::vector<uint32_t>> predecessors(n);
+	std::vector<std::vector<uint32_t>> successors(n);
+	const auto addEdge = [&](uint32_t from, uint32_t to) {
+		if (to < n) {
+			predecessors[to].push_back(from);
+			successors[from].push_back(to);
+		}
+	};
+
+	for (uint32_t i = 0; i < n; i++) {
+		const Bytecode::Instruction& ins = prototype.instructions[i];
+		const uint32_t target = i + (uint32_t)(ins.d - Bytecode::BC_OP_JMP_BIAS + 1);
+		bool jumps = false;
+		bool fallsThrough = true;
+
+		switch (ins.type) {
+		case Bytecode::BC_OP_ISLT:
+		case Bytecode::BC_OP_ISGE:
+		case Bytecode::BC_OP_ISLE:
+		case Bytecode::BC_OP_ISGT:
+		case Bytecode::BC_OP_ISEQV:
+		case Bytecode::BC_OP_ISNEV:
+		case Bytecode::BC_OP_ISEQS:
+		case Bytecode::BC_OP_ISNES:
+		case Bytecode::BC_OP_ISEQN:
+		case Bytecode::BC_OP_ISNEN:
+		case Bytecode::BC_OP_ISEQP:
+		case Bytecode::BC_OP_ISNEP:
+		case Bytecode::BC_OP_ISTC:
+		case Bytecode::BC_OP_ISFC:
+		case Bytecode::BC_OP_IST:
+		case Bytecode::BC_OP_ISF:
+		case Bytecode::BC_OP_FORI:
+		case Bytecode::BC_OP_JFORI:
+		case Bytecode::BC_OP_FORL:
+		case Bytecode::BC_OP_IFORL:
+		case Bytecode::BC_OP_JFORL:
+		case Bytecode::BC_OP_ITERL:
+		case Bytecode::BC_OP_IITERL:
+		case Bytecode::BC_OP_JITERL:
+		case Bytecode::BC_OP_LOOP:
+		case Bytecode::BC_OP_ILOOP:
+		case Bytecode::BC_OP_JLOOP:
+			jumps = true;
+			fallsThrough = true;
+			break;
+		case Bytecode::BC_OP_JMP:
+		case Bytecode::BC_OP_UCLO:
+		case Bytecode::BC_OP_ISNEXT:
+			jumps = true;
+			fallsThrough = false;
+			break;
+		case Bytecode::BC_OP_RETM:
+		case Bytecode::BC_OP_RET:
+		case Bytecode::BC_OP_RET0:
+		case Bytecode::BC_OP_RET1:
+		case Bytecode::BC_OP_CALLMT:
+		case Bytecode::BC_OP_CALLT:
+			fallsThrough = false;
+			break;
+		default:
+			break;
+		}
+
+		if (jumps) addEdge(i, target);
+		if (fallsThrough) addEdge(i, i + 1);
+	}
+
+	// Lengauer-Tarjan 支配树 (节点按 DFS 编号)。
+	std::vector<uint32_t> dfsNum(n, 0), vertex;         // 指令id -> DFS号; DFS号 -> 指令id
+	std::vector<uint32_t> parent(n, 0), semi(n, 0), idom(n, 0);
+	std::vector<uint32_t> ancestor(n, 0), label(n, 0);
+	std::vector<std::vector<uint32_t>> bucket(n);
+
+	uint32_t dfsCounter = 0;
+	// 迭代 DFS: 超长直线函数 (数万条指令) 递归会爆栈。
+	{
+		std::vector<uint32_t> stack;
+		stack.push_back(0);
+		while (!stack.empty()) {
+			const uint32_t v = stack.back();
+			stack.pop_back();
+			if (dfsNum[v]) continue;
+			dfsNum[v] = dfsCounter;
+			vertex.push_back(v);
+			dfsCounter++;
+			semi[v] = dfsNum[v];
+			for (uint32_t w : successors[v]) {
+				if (!dfsNum[w]) {
+					parent[w] = v;
+					stack.push_back(w);
+				}
+			}
+		}
+	}
+
+	// 迭代 compress: 并查集链在极端情况下也可能很深。
+	const auto compress = [&](uint32_t v) -> void {
+		std::vector<uint32_t> path;
+		uint32_t current = v;
+		while (ancestor[ancestor[current]]) {
+			path.push_back(current);
+			current = ancestor[current];
+		}
+		for (size_t i = path.size(); i-- > 0;) {
+			const uint32_t x = path[i];
+			if (semi[label[ancestor[x]]] < semi[label[x]]) label[x] = label[ancestor[x]];
+			ancestor[x] = ancestor[ancestor[x]];
+		}
+	};
+	const auto eval = [&](uint32_t v) -> uint32_t {
+		if (!ancestor[v]) return label[v];
+		compress(v);
+		return semi[label[ancestor[v]]] >= semi[label[v]] ? label[v] : label[ancestor[v]];
+	};
+	const auto link = [&](uint32_t v, uint32_t w) {
+		ancestor[w] = v;
+	};
+
+	for (uint32_t i = 0; i < n; i++) label[i] = i;
+
+	for (uint32_t i = dfsCounter; i-- > 1;) {
+		const uint32_t w = vertex[i];
+		for (uint32_t v : predecessors[w]) {
+			if (!dfsNum[v]) continue;
+			const uint32_t u = eval(v);
+			if (semi[u] < semi[w]) semi[w] = semi[u];
+		}
+		bucket[vertex[semi[w]]].push_back(w);
+		link(parent[w], w);
+		for (uint32_t v : bucket[parent[w]]) {
+			const uint32_t u = eval(v);
+			idom[v] = semi[u] < semi[v] ? u : parent[w];
+		}
+		bucket[parent[w]].clear();
+	}
+
+	for (uint32_t i = 1; i < dfsCounter; i++) {
+		const uint32_t w = vertex[i];
+		if (idom[w] != vertex[semi[w]]) idom[w] = idom[idom[w]];
+	}
+	idom[vertex[0]] = vertex[0];
+
+	// 转回指令 id 索引: idomByIns[ins] = 直接支配者指令 id。
+	std::vector<uint32_t> idomByIns(n, 0);
+	for (uint32_t i = 0; i < dfsCounter; i++) {
+		idomByIns[vertex[i]] = vertex[i] == 0 ? vertex[0] : idom[vertex[i]];
+	}
+	return idomByIns;
+}
+
+// 收集被所有子函数 (闭包) 通过 upvalue 捕获的槽位作用域。
+static void collect_captured_scopes(const Ast::Function& function, std::unordered_set<const Ast::SlotScope*>& capturedScopes) {
+	const auto collect = [&](const auto& self, const Ast::Function& fn) -> void {
+		for (const Ast::Function* child : fn.childFunctions) {
+			for (const Ast::Function::Upvalue& upvalue : child->upvalues) {
+				if (upvalue.slotScope && *upvalue.slotScope) {
+					capturedScopes.insert(*upvalue.slotScope);
+				}
+			}
+			self(self, *child);
+		}
+	};
+	collect(collect, function);
+}
+
 void Ast::propagate_cross_block_copies(Function& function) {
 	// 跨块拷贝传播: 编译器为方法调用/表达式生成的临时槽可能横跨 goto/label
 	// 重构出的多个块 (如 `local var = self.list` 在 if 分支, 使用在合并后的块),
-	// 单趟链消除的连续窗口够不到。这里用块树支配 + 无中间改写做保守传播。
+	// 单趟链消除的连续窗口够不到。这里用原始字节码 CFG 支配 + 无中间改写做保守传播。
 	// 固定点: 一轮传播内联可能引入新的跨块引用, 迭代直到不再有写入者被删除,
 	// 避免 A 内联引入的 B 引用赶不上 B 的删除判定而留下幽灵槽。
 	std::unordered_set<const SlotScope*> writtenScopes;
 	collect_written_scopes(function, writtenScopes);
 
+	const std::vector<uint32_t> cfgIdom = compute_cfg_idom(function.prototype);
+	const auto cfgDominates = [&](uint32_t a, uint32_t b) -> bool {
+		if (a >= cfgIdom.size() || b >= cfgIdom.size()) return false;
+		if (a == b) return true;
+		if (b != 0 && cfgIdom[b] == 0) return false; // b 不可达
+		uint32_t current = b;
+		while (current != 0) {
+			current = cfgIdom[current];
+			if (current == a) return true;
+		}
+		return a == 0;
+	};
+
 	// 子函数 (闭包) 通过 upvalue 捕获父函数槽位: 这些引用不在当前函数树里,
 	// 删除写入者会让闭包内的引用变成无名幽灵槽, 因此捕获的作用域不删除写入者。
 	std::unordered_set<const SlotScope*> capturedScopes;
-	{
-		const auto collectCaptured = [&](const auto& self, const Function& fn) -> void {
-			for (const Function* child : fn.childFunctions) {
-				for (const Function::Upvalue& upvalue : child->upvalues) {
-					if (upvalue.slotScope && *upvalue.slotScope) {
-						capturedScopes.insert(*upvalue.slotScope);
-					}
-				}
-				self(self, *child);
-			}
-		};
-		collectCaptured(collectCaptured, function);
-	}
+	collect_captured_scopes(function, capturedScopes);
 
 	const auto onePass = [&]() -> bool {
 		bool erasedAny = false;
 
 	// 1) 建立语句的父块/父语句/块内下标关系。
 	std::unordered_map<Statement*, std::vector<Statement*>*> ownerBlock;
-	std::unordered_map<Statement*, Statement*> ownerStatement;
 	std::unordered_map<Statement*, size_t> blockIndex;
 
-	const auto buildParent = [&](const auto& self, std::vector<Statement*>& block, Statement* owner) -> void {
+	const auto buildParent = [&](const auto& self, std::vector<Statement*>& block) -> void {
 		for (size_t j = 0; j < block.size(); j++) {
 			Statement* statement = block[j];
 			if (!statement) continue;
 			ownerBlock[statement] = &block;
-			ownerStatement[statement] = owner;
 			blockIndex[statement] = j;
-			if (!statement->block.empty()) self(self, statement->block, statement);
+			if (!statement->block.empty()) self(self, statement->block);
 		}
 	};
-	buildParent(buildParent, function.block, nullptr);
+	buildParent(buildParent, function.block);
 
 	// 2) 收集单写入者作用域、多写入者集合、引用计数。
 	std::unordered_map<SlotScope*, Statement*> writerStatement;
 	std::unordered_set<SlotScope*> multiWriter;
-	std::unordered_map<const SlotScope*, uint32_t> refCounts;
 
 	const auto collectWriter = [&](const auto& self, Statement* statement) -> void {
 		if (!statement) return;
@@ -2671,62 +2848,15 @@ void Ast::propagate_cross_block_copies(Function& function) {
 		for (const auto& [ref, useStatement] : scopeUses) {
 			if (!useStatement) { safe = false; break; }
 
-			// 块树支配: 写入者所在的块必须是使用点块路径上的祖先, 且写入者
-			// 在路径子语句之前; 路径上任何有效标签都允许跳入跳过写入者, 不安全。
-			bool dominated = false;
-			std::vector<Statement*>* writerBlock = ownerBlock[writer];
-			const size_t writerIndex = blockIndex[writer];
-			std::vector<Statement*>* useBlock = ownerBlock[useStatement];
-			Statement* pathChild = useStatement; // 路径上属于 writer 块的那个子语句
-
-			if (useBlock == writerBlock) {
-				if (writerIndex < blockIndex[useStatement]) {
-					dominated = true;
-					for (size_t j = writerIndex + 1; j < blockIndex[useStatement]; j++) {
-						if ((*writerBlock)[j] && function.is_valid_label((*writerBlock)[j]->instruction.label)) {
-							dominated = false;
-							break;
-						}
-					}
-				}
-			} else {
-				Statement* current = useStatement;
-				while (current && ownerBlock[current] != writerBlock) {
-					current = ownerStatement[current];
-				}
-				if (current && writerIndex < blockIndex[current]) {
-					dominated = true;
-					pathChild = current;
-					// writer 块中 writer 之后到 pathChild 之间不得有标签。
-					for (size_t j = writerIndex + 1; j < blockIndex[current]; j++) {
-						if ((*writerBlock)[j] && function.is_valid_label((*writerBlock)[j]->instruction.label)) {
-							dominated = false;
-							break;
-						}
-					}
-				}
-			}
-
-			if (!dominated || !(writer->instruction.id < useStatement->instruction.id)) {
+			// CFG 支配: 写入指令必须支配使用指令, 即从函数入口到使用点的
+			// 所有路径都经过写入者。这正确处理了 if 分支 + goto 合并点:
+			// 只有写入者所在路径才能到达使用点时, 传播是安全的。
+			if (writer->instruction.id == INVALID_ID
+				|| useStatement->instruction.id == INVALID_ID
+				|| !cfgDominates(writer->instruction.id, useStatement->instruction.id)) {
 				safe = false;
 				break;
 			}
-			// 使用点自身是跳转目标时, 跳入会跳过写入者。
-			if (function.is_valid_label(useStatement->instruction.label)) {
-				safe = false;
-				break;
-			}
-
-			// 路径子语句链上不得有标签: 跳入会跳过写入者。
-			if (useBlock != writerBlock) {
-				Statement* pathStmt = ownerStatement[useStatement];
-				while (pathStmt && pathStmt != pathChild) {
-					if (function.is_valid_label(pathStmt->instruction.label)) { safe = false; break; }
-					pathStmt = ownerStatement[pathStmt];
-				}
-				if (safe && pathStmt == pathChild && function.is_valid_label(pathChild->instruction.label)) safe = false;
-			}
-			if (!safe) break;
 
 			// 无中间改写: 写入者与使用点之间, RHS 引用的任何槽位不得被重新赋值。
 			if (!rhsSlots.empty() && writer->instruction.id != INVALID_ID && useStatement->instruction.id != INVALID_ID) {
@@ -2757,8 +2887,6 @@ void Ast::propagate_cross_block_copies(Function& function) {
 				|| !(*ref)->variable->slotScope) {
 				continue;
 			}
-			SlotScope* oldScope = *(*ref)->variable->slotScope;
-			if (oldScope) refCounts[oldScope]--;
 			*ref = rhs;
 		}
 
@@ -2809,12 +2937,12 @@ void Ast::propagate_cross_block_copies(Function& function) {
 				return count;
 			};
 			uint32_t total = 0;
-			const auto walkRoot = [&](const auto& self, std::vector<Statement*>& block) -> void {
+			const auto walkRoot = [&](std::vector<Statement*>& block) -> void {
 				for (Statement* statement : block) {
 					if (statement) total += countRefs(countRefs, statement);
 				}
 			};
-			walkRoot(walkRoot, function.block);
+			walkRoot(function.block);
 			eraseWriter = (total == 0);
 		}
 
@@ -2844,22 +2972,6 @@ void Ast::propagate_cross_block_copies(Function& function) {
 	};
 
 	while (onePass()) {}
-}
-
-static bool expression_same_variable(const Ast::Expression* a, const Ast::Expression* b) {
-	if (!a || !b || a->type != Ast::AST_EXPRESSION_VARIABLE || b->type != Ast::AST_EXPRESSION_VARIABLE) return false;
-	if (a->variable->type != b->variable->type) return false;
-
-	switch (a->variable->type) {
-	case Ast::AST_VARIABLE_SLOT:
-		return a->variable->slot == b->variable->slot && *a->variable->slotScope == *b->variable->slotScope;
-	case Ast::AST_VARIABLE_UPVALUE:
-		return a->variable->slotScope == b->variable->slotScope;
-	default:
-		break;
-	}
-
-	return false;
 }
 
 void Ast::restore_method_calls(Function& function, std::vector<Statement*>& block) {
@@ -4642,15 +4754,22 @@ void Ast::cleanup_unused_declarations(Function& function, std::vector<Statement*
 		if (statement && !statement->block.empty()) cleanup_unused_declarations(function, statement->block);
 	}
 
-	// 收集在所有表达式和非空赋值中被引用的槽位
-	std::unordered_set<uint8_t> usedSlots;
+	// 子函数 (闭包) 通过 upvalue 捕获的槽位不在此函数树内, 删除声明会让闭包
+	// 引用悬空, 必须保留。
+	std::unordered_set<const SlotScope*> capturedScopes;
+	collect_captured_scopes(function, capturedScopes);
+
+	// 收集在所有表达式和非空赋值中被引用的作用域 (按作用域身份, 而非槽位号)
+	std::unordered_set<const SlotScope*> usedScopes;
 
 	auto collect_from_expr = [&](const auto& self, Expression* const& expr)->void {
 		if (!expr) return;
 		switch (expr->type) {
 		case AST_EXPRESSION_VARIABLE:
 			if (expr->variable->type == AST_VARIABLE_SLOT) {
-				usedSlots.insert(expr->variable->slot);
+				if (expr->variable->slotScope && *expr->variable->slotScope) {
+					usedScopes.insert(*expr->variable->slotScope);
+				}
 			} else if (expr->variable->type == AST_VARIABLE_TABLE_INDEX) {
 				self(self, expr->variable->table);
 				self(self, expr->variable->tableIndex);
@@ -4680,9 +4799,12 @@ void Ast::cleanup_unused_declarations(Function& function, std::vector<Statement*
 	auto collect_from_statement = [&](const auto& self, Statement* const& stmt)->void {
 		if (!stmt) return;
 		for (Expression* expr : stmt->assignment.expressions) collect_from_expr(collect_from_expr, expr);
+		if (stmt->assignment.multresReturn) collect_from_expr(collect_from_expr, stmt->assignment.multresReturn);
 		if (stmt->type != AST_STATEMENT_DECLARATION) {
 			for (const Variable& var : stmt->assignment.variables) {
-				if (var.type == AST_VARIABLE_SLOT) usedSlots.insert(var.slot);
+				if (var.type == AST_VARIABLE_SLOT) {
+					if (var.slotScope && *var.slotScope) usedScopes.insert(*var.slotScope);
+				}
 				else if (var.type == AST_VARIABLE_TABLE_INDEX) {
 					collect_from_expr(collect_from_expr, var.table);
 					collect_from_expr(collect_from_expr, var.tableIndex);
@@ -4694,22 +4816,30 @@ void Ast::cleanup_unused_declarations(Function& function, std::vector<Statement*
 
 	for (Statement* s : function.block) collect_from_statement(collect_from_statement, s);
 
-	// 移除没有初始值且槽位从未被任何表达式或赋值引用的空声明
+	// 移除从未被引用的声明: 无初始值的空声明, 或纯初始值且无副作用的单变量声明。
 	for (auto it = block.begin(); it != block.end();) {
 		Statement* stmt = *it;
 		if (stmt && stmt->type == AST_STATEMENT_DECLARATION
-			&& stmt->assignment.expressions.empty()
-			&& !function.hasDebugInfo) {
-			bool allUnused = true;
-			for (const Variable& var : stmt->assignment.variables) {
-				if (var.type == AST_VARIABLE_SLOT && usedSlots.contains(var.slot)) {
-					allUnused = false;
-					break;
+			&& !function.is_valid_label(stmt->instruction.label)
+			&& stmt->assignment.variables.size() == 1
+			&& stmt->assignment.variables.back().type == AST_VARIABLE_SLOT
+			&& stmt->assignment.variables.back().slotScope
+			&& *stmt->assignment.variables.back().slotScope) {
+			const SlotScope* scope = *stmt->assignment.variables.back().slotScope;
+			const bool isUnused = !usedScopes.contains(scope) && !capturedScopes.contains(scope);
+			if (isUnused) {
+				const bool empty = stmt->assignment.expressions.empty();
+				const bool pureInit = !empty
+					&& stmt->assignment.expressions.size() == 1
+					&& stmt->assignment.expressions.back()
+					&& !expression_has_side_effects(stmt->assignment.expressions.back())
+					&& !expression_references_scope(stmt->assignment.expressions.back(), scope);
+				// 空声明沿用旧行为: 仅剥离调试信息的字节码才删除 (避免改动真实局部变量输出);
+				// 纯初始化的死声明对任何字节码都可安全删除。
+				if ((empty && !function.hasDebugInfo) || pureInit) {
+					it = block.erase(it);
+					continue;
 				}
-			}
-			if (allUnused) {
-				it = block.erase(it);
-				continue;
 			}
 		}
 		++it;
