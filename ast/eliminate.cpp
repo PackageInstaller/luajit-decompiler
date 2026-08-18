@@ -1723,38 +1723,52 @@ bool Ast::restore_method_calls(Function& function, std::vector<Statement*>& bloc
 	bool changed = false;
 
 	struct SlotCopy {
+		std::vector<Statement*>* owner = nullptr;
 		uint32_t index = INVALID_ID;
 		Expression* rhs = nullptr;
 		bool unique = true;
 	};
-	std::unordered_map<uint8_t, SlotCopy> copies;
-	std::unordered_set<uint8_t> consumedCopySlots;
+	std::unordered_map<const SlotScope*, SlotCopy> copiesByScope;
+	std::unordered_set<const SlotScope*> consumedCopyScopes;
+	std::unordered_set<const SlotScope*> capturedScopes;
+	collect_captured_scopes(function, capturedScopes);
 
-	for (uint32_t i = 0; i < block.size(); i++) {
-		Statement* statement = block[i];
-		if (!statement) continue;
-		if ((statement->type != AST_STATEMENT_ASSIGNMENT && statement->type != AST_STATEMENT_DECLARATION)
-			|| statement->assignment.variables.size() != 1
-			|| statement->assignment.expressions.size() != 1
-			|| statement->assignment.variables.back().type != AST_VARIABLE_SLOT)
-			continue;
-		Expression* rhs = statement->assignment.expressions.back();
-		if (!rhs) continue;
-		const uint8_t toSlot = statement->assignment.variables.back().slot;
-		auto it = copies.find(toSlot);
-		if (it == copies.end()) {
-			copies[toSlot] = { .index = i, .rhs = rhs, .unique = true };
-		} else {
-			it->second.unique = false;
+	const auto collectCopies = [&](const auto& self, std::vector<Statement*>& blk) -> void {
+		for (uint32_t i = 0; i < blk.size(); i++) {
+			Statement* statement = blk[i];
+			if (!statement) continue;
+			if ((statement->type == AST_STATEMENT_ASSIGNMENT || statement->type == AST_STATEMENT_DECLARATION)
+				&& statement->assignment.variables.size() == 1
+				&& statement->assignment.expressions.size() == 1
+				&& statement->assignment.variables.back().type == AST_VARIABLE_SLOT
+				&& statement->assignment.variables.back().slotScope
+				&& *statement->assignment.variables.back().slotScope) {
+				Expression* rhs = statement->assignment.expressions.back();
+				if (rhs) {
+					const SlotScope* scope = *statement->assignment.variables.back().slotScope;
+					auto it = copiesByScope.find(scope);
+					if (it == copiesByScope.end()) {
+						copiesByScope[scope] = { .owner = &blk, .index = i, .rhs = rhs, .unique = true };
+					} else {
+						it->second.unique = false;
+					}
+				}
+			}
+			if (!statement->block.empty()) self(self, statement->block);
 		}
-	}
+	};
+
+	// 从整棵函数树收集 MOV 副本, 让 DECLARATION 子块里的方法调用
+	// 能匹配到父块里的 self 槽拷贝 (debug 局部会把调用包进声明块)。
+	collectCopies(collectCopies, function.block);
 
 	const auto argMatchesReceiver = [&](const Expression* arg, const Expression* receiver) -> bool {
 		if (!arg || !receiver) return false;
 		if (expressions_equal(*arg, *receiver)) return true;
 		if (arg->type != AST_EXPRESSION_VARIABLE || arg->variable->type != AST_VARIABLE_SLOT) return false;
-		auto it = copies.find(arg->variable->slot);
-		if (it == copies.end() || !it->second.unique || !it->second.rhs) return false;
+		if (!arg->variable->slotScope || !*arg->variable->slotScope) return false;
+		auto it = copiesByScope.find(*arg->variable->slotScope);
+		if (it == copiesByScope.end() || !it->second.unique || !it->second.rhs) return false;
 		return expressions_equal(*it->second.rhs, *receiver);
 	};
 
@@ -1778,8 +1792,10 @@ bool Ast::restore_method_calls(Function& function, std::vector<Statement*>& bloc
 
 		if (functionCall->arguments.front()->type == AST_EXPRESSION_VARIABLE
 			&& functionCall->arguments.front()->variable->type == AST_VARIABLE_SLOT
+			&& functionCall->arguments.front()->variable->slotScope
+			&& *functionCall->arguments.front()->variable->slotScope
 			&& !expressions_equal(*functionCall->arguments.front(), *receiver)) {
-			consumedCopySlots.insert(functionCall->arguments.front()->variable->slot);
+			consumedCopyScopes.insert(*functionCall->arguments.front()->variable->slotScope);
 		}
 
 		functionCall->isMethod = true;
@@ -1819,111 +1835,132 @@ bool Ast::restore_method_calls(Function& function, std::vector<Statement*>& bloc
 		}
 	};
 
-	for (uint32_t i = 0; i < block.size(); i++) {
-		Statement* statement = block[i];
-		if (!statement) continue;
-		if (!statement->block.empty() && restore_method_calls(function, statement->block)) changed = true;
-		for (Expression* expression : statement->assignment.expressions) walkExpression(walkExpression, expression);
-		walkExpression(walkExpression, statement->assignment.multresReturn);
-		for (Variable& variable : statement->assignment.variables) {
-			walkExpression(walkExpression, variable.table);
-			walkExpression(walkExpression, variable.tableIndex);
+	const auto walkBlock = [&](const auto& self, std::vector<Statement*>& blk) -> void {
+		for (Statement* statement : blk) {
+			if (!statement) continue;
+			if (!statement->block.empty()) self(self, statement->block);
+			for (Expression* expression : statement->assignment.expressions) walkExpression(walkExpression, expression);
+			walkExpression(walkExpression, statement->assignment.multresReturn);
+			for (Variable& variable : statement->assignment.variables) {
+				walkExpression(walkExpression, variable.table);
+				walkExpression(walkExpression, variable.tableIndex);
+			}
 		}
-	}
+	};
+	walkBlock(walkBlock, function.block);
 
 	// 方法还原后, 仅为 self 副本存在的 MOV 若已无引用则删除。
 	// 只删 tryRestore 真正消耗过的副本, 避免把普通赋值当成拷贝清掉。
-	std::vector<uint32_t> eraseCopies;
-	for (const auto& [toSlot, copy] : copies) {
-		if (!copy.unique || copy.index >= block.size() || !consumedCopySlots.contains(toSlot)) continue;
+	struct EraseCopy {
+		std::vector<Statement*>* owner = nullptr;
+		uint32_t index = INVALID_ID;
+	};
+	std::vector<EraseCopy> eraseCopies;
+	for (const auto& [scope, copy] : copiesByScope) {
+		if (!copy.unique || !copy.owner || copy.index >= copy.owner->size()) continue;
+		if (!consumedCopyScopes.contains(scope)) continue;
+		if (capturedScopes.contains(scope)) continue;
 		if (copy.rhs && expression_has_side_effects(copy.rhs)) continue;
-		Statement* writer = block[copy.index];
+		Statement* writer = (*copy.owner)[copy.index];
 		if (!writer || writer->assignment.variables.size() != 1) continue;
 		if (!writer->assignment.variables.back().slotScope || !*writer->assignment.variables.back().slotScope) continue;
-		SlotScope* scope = *writer->assignment.variables.back().slotScope;
-		if (count_scope_reads_in_block(function.block, scope) == 0) eraseCopies.emplace_back(copy.index);
+		if (count_scope_reads_in_block(function.block, scope) == 0) {
+			eraseCopies.push_back({ .owner = copy.owner, .index = copy.index });
+		}
 	}
 	if (!eraseCopies.empty()) {
-		std::sort(eraseCopies.begin(), eraseCopies.end(), std::greater<>());
-		for (uint32_t index : eraseCopies) {
-			Statement* writer = block[index];
+		std::sort(eraseCopies.begin(), eraseCopies.end(), [](const EraseCopy& a, const EraseCopy& b) {
+			if (a.owner != b.owner) return a.owner < b.owner;
+			return a.index > b.index;
+		});
+		for (const EraseCopy& erase : eraseCopies) {
+			Statement* writer = (*erase.owner)[erase.index];
 			function.slotScopeCollector.remove_scope(writer->assignment.variables.back().slot, writer->assignment.variables.back().slotScope);
-			block.erase(block.begin() + index);
+			erase.owner->erase(erase.owner->begin() + erase.index);
 			changed = true;
 		}
 	}
 
 	// 语句级方法调用的接收者若来自紧邻的单用途槽赋值, 进一步内联。
 	// 循环体第一条语句常带入口标签: 内联时把标签转给使用点, 语义不变。
-	for (uint32_t i = 0; i < block.size(); i++) {
-		Statement* statement = block[i];
-		if (!statement) continue;
-
-		FunctionCall* functionCall = nullptr;
-		if ((statement->type == AST_STATEMENT_FUNCTION_CALL
-				|| statement->type == AST_STATEMENT_ASSIGNMENT
-				|| statement->type == AST_STATEMENT_DECLARATION)
-			&& statement->assignment.expressions.size() == 1
-			&& statement->assignment.expressions.back()
-			&& statement->assignment.expressions.back()->type == AST_EXPRESSION_FUNCTION_CALL
-			&& statement->assignment.expressions.back()->functionCall->isMethod) {
-			functionCall = statement->assignment.expressions.back()->functionCall;
-		} else if (statement->type == AST_STATEMENT_RETURN
-			&& statement->assignment.multresReturn
-			&& statement->assignment.multresReturn->type == AST_EXPRESSION_FUNCTION_CALL
-			&& statement->assignment.multresReturn->functionCall->isMethod) {
-			functionCall = statement->assignment.multresReturn->functionCall;
+	const auto inlineReceivers = [&](const auto& self, std::vector<Statement*>& blk) -> void {
+		for (Statement* nested : blk) {
+			if (nested && !nested->block.empty()) self(self, nested->block);
 		}
 
-		if (!functionCall) continue;
+		for (uint32_t i = 0; i < blk.size(); i++) {
+			Statement* statement = blk[i];
+			if (!statement) continue;
 
-		Expression* fn = functionCall->function;
-		if (!fn || fn->type != AST_EXPRESSION_VARIABLE || fn->variable->type != AST_VARIABLE_TABLE_INDEX) continue;
-		Expression* receiver = fn->variable->table;
-		if (!receiver || receiver->type != AST_EXPRESSION_VARIABLE || receiver->variable->type != AST_VARIABLE_SLOT) continue;
-		if (!receiver->variable->slotScope || !*receiver->variable->slotScope) continue;
-		SlotScope* receiverScope = *receiver->variable->slotScope;
-
-		uint32_t writer = INVALID_ID;
-		for (uint32_t k = i, scanned = 0; k-- > 0 && scanned < 64;) {
-			scanned++;
-			Statement* previous = block[k];
-			if (previous->type == AST_STATEMENT_GOTO || previous->type == AST_STATEMENT_EMPTY) {
-				if (function.is_valid_label(previous->instruction.label)) break;
-				continue;
+			FunctionCall* functionCall = nullptr;
+			if ((statement->type == AST_STATEMENT_FUNCTION_CALL
+					|| statement->type == AST_STATEMENT_ASSIGNMENT
+					|| statement->type == AST_STATEMENT_DECLARATION)
+				&& statement->assignment.expressions.size() == 1
+				&& statement->assignment.expressions.back()
+				&& statement->assignment.expressions.back()->type == AST_EXPRESSION_FUNCTION_CALL
+				&& statement->assignment.expressions.back()->functionCall->isMethod) {
+				functionCall = statement->assignment.expressions.back()->functionCall;
+			} else if (statement->type == AST_STATEMENT_RETURN
+				&& statement->assignment.multresReturn
+				&& statement->assignment.multresReturn->type == AST_EXPRESSION_FUNCTION_CALL
+				&& statement->assignment.multresReturn->functionCall->isMethod) {
+				functionCall = statement->assignment.multresReturn->functionCall;
 			}
-			if ((previous->type == AST_STATEMENT_ASSIGNMENT || previous->type == AST_STATEMENT_DECLARATION)
-				&& previous->assignment.variables.size() == 1
-				&& previous->assignment.expressions.size() == 1
-				&& previous->assignment.variables.back().type == AST_VARIABLE_SLOT
-				&& previous->assignment.variables.back().slot == receiver->variable->slot
-				&& count_scope_reads_in_block(function.block, receiverScope) == 1) {
-				if (function.is_valid_label(previous->instruction.label)
-					&& function.is_valid_label(statement->instruction.label))
+
+			if (!functionCall) continue;
+
+			Expression* fn = functionCall->function;
+			if (!fn || fn->type != AST_EXPRESSION_VARIABLE || fn->variable->type != AST_VARIABLE_TABLE_INDEX) continue;
+			Expression* receiver = fn->variable->table;
+			if (!receiver || receiver->type != AST_EXPRESSION_VARIABLE || receiver->variable->type != AST_VARIABLE_SLOT) continue;
+			if (!receiver->variable->slotScope || !*receiver->variable->slotScope) continue;
+			SlotScope* receiverScope = *receiver->variable->slotScope;
+			if (capturedScopes.contains(receiverScope)) continue;
+
+			uint32_t writer = INVALID_ID;
+			for (uint32_t k = i, scanned = 0; k-- > 0 && scanned < 64;) {
+				scanned++;
+				Statement* previous = blk[k];
+				if (previous->type == AST_STATEMENT_GOTO || previous->type == AST_STATEMENT_EMPTY) {
+					if (function.is_valid_label(previous->instruction.label)) break;
+					continue;
+				}
+				if ((previous->type == AST_STATEMENT_ASSIGNMENT || previous->type == AST_STATEMENT_DECLARATION)
+					&& previous->assignment.variables.size() == 1
+					&& previous->assignment.expressions.size() == 1
+					&& previous->assignment.variables.back().type == AST_VARIABLE_SLOT
+					&& previous->assignment.variables.back().slot == receiver->variable->slot
+					&& count_scope_reads_in_block(function.block, receiverScope) == 1) {
+					if (function.is_valid_label(previous->instruction.label)
+						&& function.is_valid_label(statement->instruction.label))
+						break;
+					writer = k;
 					break;
-				writer = k;
+				}
 				break;
 			}
-			break;
+
+			if (writer == INVALID_ID) continue;
+
+			Statement* writerStatement = blk[writer];
+			Expression* rhs = writerStatement->assignment.expressions.back();
+			if (!rhs || expression_references_scope(rhs, receiverScope)) continue;
+
+			if (function.is_valid_label(writerStatement->instruction.label)
+				&& !function.is_valid_label(statement->instruction.label)) {
+				statement->instruction.label = writerStatement->instruction.label;
+			}
+
+			fn->variable->table = rhs;
+			function.slotScopeCollector.remove_scope(writerStatement->assignment.variables.back().slot, writerStatement->assignment.variables.back().slotScope);
+			blk.erase(blk.begin() + writer);
+			i--;
+			changed = true;
 		}
+	};
+	inlineReceivers(inlineReceivers, function.block);
 
-		if (writer == INVALID_ID) continue;
-
-		Statement* writerStatement = block[writer];
-		Expression* rhs = writerStatement->assignment.expressions.back();
-		if (!rhs || expression_references_scope(rhs, receiverScope)) continue;
-
-		if (function.is_valid_label(writerStatement->instruction.label)
-			&& !function.is_valid_label(statement->instruction.label)) {
-			statement->instruction.label = writerStatement->instruction.label;
-		}
-
-		fn->variable->table = rhs;
-		function.slotScopeCollector.remove_scope(writerStatement->assignment.variables.back().slot, writerStatement->assignment.variables.back().slotScope);
-		block.erase(block.begin() + writer);
-		i--;
-		changed = true;
-	}
-
+	(void)block;
 	return changed;
 }

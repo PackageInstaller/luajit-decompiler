@@ -21,6 +21,21 @@
   `local x = self[k]:GetComponent("Button").onClick; x:RemoveListener(v)`
   折叠为 `self[k]:GetComponent("Button").onClick:RemoveListener(v)`；
 - 方法还原与跨块传播交替至固定点，折叠“还原后才变成单用途”的接收者临时槽。
+- 按 `SlotScope*` 从整棵函数树收集 MOV 副本，调试局部把调用包进
+  `DECLARATION` 子块时仍能还原冒号调用，并把
+  `local a = Find("Image"); local b = a; local bg = a.GetComponent(b, "Image")`
+  折叠为 `local bg = Find("Image"):GetComponent("Image")`。
+
+**条件默认值与调试名拷贝**
+
+- `local x = soulPOD.favor; if not soulPOD.favor then x = 0 end; self.favor = x`
+  在条件已被内联成字段本身后仍识别，输出 `self.favor = soulPOD.favor or 0`；
+- 合并单用途拷贝 `local var = expr; local name = var` 为 `local name = expr`，
+  以及 `local var = expr; return var` 为 `return expr`。
+  同一槽位号上连续两个 `SlotScope`（编译器 MOV 切开的调试名）按作用域身份
+  区分，不再误判成同一个变量。
+- `x = A; if A then x = B end` 折叠为 `x = A and B`
+  （`ToggleTown:SetActive(self.showUI and Unlock(...))`）。
 
 **仍保守拒绝（行为正确）**
 

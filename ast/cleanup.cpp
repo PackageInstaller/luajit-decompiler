@@ -576,6 +576,9 @@ void Ast::optimize_conditional_assignments(Function& function, std::vector<State
 		if (statement && !statement->block.empty()) optimize_conditional_assignments(function, statement->block);
 	}
 
+	std::unordered_set<const SlotScope*> capturedScopes;
+	collect_captured_scopes(function, capturedScopes);
+
 	// 1. 简化所有已有赋值中的表达式 (如 (a > b) and true or false -> a > b)
 	for (Statement* statement : block) {
 		if (!statement) continue;
@@ -673,12 +676,18 @@ void Ast::optimize_conditional_assignments(Function& function, std::vector<State
 				Expression* conditionOperand = ifStatement->assignment.expressions.back()->unaryOperation->operand;
 				Statement* innerAssignment = ifStatement->block.front();
 
+				const bool condMatchesVar = expression_matches_variable(*conditionOperand, prev->assignment.variables.front());
+				const bool condMatchesRhs = !prev->assignment.expressions.empty()
+					&& prev->assignment.expressions.back()
+					&& expressions_equal(*conditionOperand, *prev->assignment.expressions.back())
+					&& !expression_has_side_effects(prev->assignment.expressions.back());
+
 				if (innerAssignment
 					&& innerAssignment->type == AST_STATEMENT_ASSIGNMENT
 					&& innerAssignment->assignment.variables.size() == 1
 					&& innerAssignment->assignment.expressions.size() == 1
 					&& variables_equal(innerAssignment->assignment.variables.front(), prev->assignment.variables.front())
-					&& (prev->assignment.expressions.empty() || expression_matches_variable(*conditionOperand, prev->assignment.variables.front()))) {
+					&& (prev->assignment.expressions.empty() ? condMatchesVar : (condMatchesVar || condMatchesRhs))) {
 
 					Expression* defaultValue = innerAssignment->assignment.expressions.back();
 					Expression* baseValue = prev->assignment.expressions.empty()
@@ -692,16 +701,26 @@ void Ast::optimize_conditional_assignments(Function& function, std::vector<State
 					prev->assignment.expressions.emplace_back(orExpression);
 					block.erase(block.begin() + i + 1);
 
-					// 若变量紧随其后被直接赋值给同一目标，则进一步内联为 `target = target or default`
-					if (i + 1 < block.size()) {
+					// 随后若是 `target = x` 且 x 只剩这一处引用, 内联为 `target = E or D`。
+					// 不再要求 target 与条件操作数相同 (self.favor = soulPOD.favor or 0)。
+					if (i + 1 < block.size()
+						&& prev->assignment.variables.back().type == AST_VARIABLE_SLOT
+						&& prev->assignment.variables.back().slotScope
+						&& *prev->assignment.variables.back().slotScope) {
 						Statement* assignment = block[i + 1];
+						SlotScope* scope = *prev->assignment.variables.back().slotScope;
 						if (assignment
-							&& assignment->type == AST_STATEMENT_ASSIGNMENT
+							&& (assignment->type == AST_STATEMENT_ASSIGNMENT || assignment->type == AST_STATEMENT_DECLARATION)
 							&& assignment->assignment.variables.size() == 1
 							&& assignment->assignment.expressions.size() == 1
 							&& expression_matches_variable(*assignment->assignment.expressions.back(), prev->assignment.variables.back())
-							&& expression_matches_variable(*conditionOperand, assignment->assignment.variables.back())) {
+							&& capturedScopes.find(scope) == capturedScopes.end()
+							&& count_scope_reads_in_block(function.block, scope) == 1) {
 							assignment->assignment.expressions.back() = orExpression;
+							if (function.is_valid_label(prev->instruction.label)
+								&& !function.is_valid_label(assignment->instruction.label)) {
+								assignment->instruction.label = prev->instruction.label;
+							}
 							block.erase(block.begin() + i);
 						}
 					}
@@ -766,6 +785,122 @@ void Ast::optimize_conditional_assignments(Function& function, std::vector<State
 					}
 					decl->assignment.expressions.push_back(nextStmt->assignment.expressions.front());
 					block.erase(block.begin() + i + 1);
+					i = i ? i - 1 : 0;
+					continue;
+				}
+			}
+		}
+
+		// Pattern E: x = A; if A then x = B end => x = A and B
+		if (i + 1 < block.size()) {
+			Statement* prev = block[i];
+			Statement* ifStatement = block[i + 1];
+			if (prev && ifStatement
+				&& (prev->type == AST_STATEMENT_DECLARATION || prev->type == AST_STATEMENT_ASSIGNMENT)
+				&& ifStatement->type == AST_STATEMENT_IF
+				&& (i + 2 >= block.size() || block[i + 2]->type != AST_STATEMENT_ELSE)
+				&& prev->assignment.variables.size() == 1
+				&& prev->assignment.variables.back().type == AST_VARIABLE_SLOT
+				&& prev->assignment.variables.back().slotScope
+				&& *prev->assignment.variables.back().slotScope
+				&& capturedScopes.find(*prev->assignment.variables.back().slotScope) == capturedScopes.end()
+				&& prev->assignment.expressions.size() == 1
+				&& prev->assignment.expressions.back()
+				&& !expression_has_side_effects(prev->assignment.expressions.back())
+				&& ifStatement->assignment.expressions.size() == 1
+				&& ifStatement->block.size() == 1) {
+				Expression* condition = ifStatement->assignment.expressions.back();
+				Statement* innerAssignment = ifStatement->block.front();
+				const bool condMatchesVar = expression_matches_variable(*condition, prev->assignment.variables.front());
+				const bool condMatchesRhs = expressions_equal(*condition, *prev->assignment.expressions.back());
+				if (innerAssignment
+					&& innerAssignment->type == AST_STATEMENT_ASSIGNMENT
+					&& innerAssignment->assignment.variables.size() == 1
+					&& innerAssignment->assignment.expressions.size() == 1
+					&& variables_equal(innerAssignment->assignment.variables.front(), prev->assignment.variables.front())
+					&& (condMatchesVar || condMatchesRhs)
+					&& !function.is_valid_label(ifStatement->instruction.label)
+					&& !function.is_valid_label(innerAssignment->instruction.label)) {
+					Expression* andExpression = new_binary_operation(AST_BINARY_AND,
+						prev->assignment.expressions.back(),
+						innerAssignment->assignment.expressions.back());
+					andExpression = simplify_expression(andExpression);
+					prev->assignment.expressions.back() = andExpression;
+					block.erase(block.begin() + i + 1);
+					i = i ? i - 1 : 0;
+					continue;
+				}
+			}
+		}
+
+		// Pattern F: 单用途拷贝内联
+		//   local var = expr; local name = var     => local name = expr
+		//   local var = expr; target = var         => target = expr
+		// 注意: 同一槽位号可有连续两个 SlotScope (编译器 MOV 切开的调试名),
+		// 不能用槽位号判断“同一个变量”。
+		if (i + 1 < block.size()) {
+			Statement* prev = block[i];
+			Statement* nextStmt = block[i + 1];
+			if (prev && nextStmt
+				&& (prev->type == AST_STATEMENT_DECLARATION || prev->type == AST_STATEMENT_ASSIGNMENT)
+				&& prev->assignment.variables.size() == 1
+				&& prev->assignment.expressions.size() == 1
+				&& prev->assignment.variables.back().type == AST_VARIABLE_SLOT
+				&& prev->assignment.variables.back().slotScope
+				&& *prev->assignment.variables.back().slotScope) {
+				SlotScope* scope = *prev->assignment.variables.back().slotScope;
+
+				const auto isCopyOfPrev = [&](const Expression* expr) -> bool {
+					if (!expr || expr->type != AST_EXPRESSION_VARIABLE || expr->variable->type != AST_VARIABLE_SLOT) return false;
+					if (expr->variable->slotScope && *expr->variable->slotScope == scope) return true;
+					return expr->variable->slot == prev->assignment.variables.back().slot;
+				};
+				const auto sameSlotScope = [&](const Variable& variable) -> bool {
+					return variable.type == AST_VARIABLE_SLOT
+						&& variable.slotScope
+						&& *variable.slotScope == scope;
+				};
+				const auto tryInlineInto = [&](Statement* sink) -> bool {
+					if (!sink) return false;
+					Expression** targetExpr = nullptr;
+					if ((sink->type == AST_STATEMENT_ASSIGNMENT || sink->type == AST_STATEMENT_DECLARATION)
+						&& sink->assignment.variables.size() == 1
+						&& sink->assignment.expressions.size() == 1
+						&& sink->assignment.expressions.back()
+						&& isCopyOfPrev(sink->assignment.expressions.back())
+						&& !sameSlotScope(sink->assignment.variables.back())) {
+						targetExpr = &sink->assignment.expressions.back();
+					} else if (sink->type == AST_STATEMENT_RETURN
+						&& !sink->assignment.multresReturn
+						&& sink->assignment.expressions.size() == 1
+						&& sink->assignment.expressions.back()
+						&& isCopyOfPrev(sink->assignment.expressions.back())) {
+						targetExpr = &sink->assignment.expressions.back();
+					} else {
+						return false;
+					}
+					if (function.is_valid_label(prev->instruction.label)
+						&& function.is_valid_label(sink->instruction.label))
+						return false;
+					if (capturedScopes.find(scope) != capturedScopes.end()) return false;
+					if (count_scope_reads_in_block(function.block, scope) != 1) return false;
+					if (prev->assignment.expressions.back()
+						&& expression_references_scope(prev->assignment.expressions.back(), scope))
+						return false;
+					*targetExpr = prev->assignment.expressions.back();
+					if (function.is_valid_label(prev->instruction.label)
+						&& !function.is_valid_label(sink->instruction.label)) {
+						sink->instruction.label = prev->instruction.label;
+					}
+					return true;
+				};
+
+				if (tryInlineInto(nextStmt)
+					|| (nextStmt->type == AST_STATEMENT_DECLARATION
+						&& nextStmt->assignment.expressions.empty()
+						&& !nextStmt->block.empty()
+						&& tryInlineInto(nextStmt->block.front()))) {
+					block.erase(block.begin() + i);
 					i = i ? i - 1 : 0;
 					continue;
 				}
